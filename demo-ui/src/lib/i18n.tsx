@@ -56,11 +56,8 @@ const translations = {
     'scenario.partialHint': 'Visible with permission',
     'scenario.hiddenFromOthers': 'Unauthorized',
     'scenario.permissionRequired': 'Authorized',
-    'scenario.step.purchase': 'Order',
     'scenario.step.receipt': 'Paid',
-    'scenario.step.payroll': 'Send',
     'scenario.step.processed': 'Received',
-    'scenario.step.agreement': 'Agree',
     'scenario.step.confirmed': 'Settled',
 
     // DBExplorer
@@ -145,11 +142,8 @@ const translations = {
     'scenario.partialHint': '권한 보유시 조회 가능',
     'scenario.hiddenFromOthers': '권한 미보유자',
     'scenario.permissionRequired': '권한 보유자',
-    'scenario.step.purchase': '주문',
     'scenario.step.receipt': '결제됨',
-    'scenario.step.payroll': '전송',
     'scenario.step.processed': '수신됨',
-    'scenario.step.agreement': '합의',
     'scenario.step.confirmed': '정산됨',
 
     // DBExplorer

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useTranslation } from '../../lib/i18n'
-import { Wallet, Play, RotateCcw, CheckCircle2, Loader2, Landmark, Store, Building2, ArrowLeftRight, ShoppingCart, FileText, Handshake } from 'lucide-react'
+import { Wallet, Play, RotateCcw, CheckCircle2, Loader2, Landmark, Store, Building2, ArrowLeftRight } from 'lucide-react'
 import { Connection, Keypair, PublicKey } from '@solana/web3.js'
 import { getOrCreateAssociatedTokenAccount, transfer as splTransfer } from '@solana/spl-token'
 import { PERSONAS } from '../../lib/authContext'
@@ -34,17 +34,15 @@ interface Channel {
   toName: string
   caseKey: string
   icon: 'store' | 'building' | 'exchange'
-  stepLeft: string
   stepRight: string
-  stepLeftIcon: 'cart' | 'filetext' | 'handshake'
 }
 
 const USDC_DECIMALS = 6
 
 const CHANNELS: Channel[] = [
-  { id: 'A', privacy: 'public', amount: 0.01, toAddress: PERSONAS[0].pubkey, toName: PERSONAS[0].name, caseKey: 'scenario.case.merchant', icon: 'store', stepLeft: 'scenario.step.purchase', stepRight: 'scenario.step.receipt', stepLeftIcon: 'cart' },
-  { id: 'B', privacy: 'private', amount: 0.01, toAddress: PERSONAS[1].pubkey, toName: PERSONAS[1].name, caseKey: 'scenario.case.salary', icon: 'building', stepLeft: 'scenario.step.payroll', stepRight: 'scenario.step.processed', stepLeftIcon: 'filetext' },
-  { id: 'C', privacy: 'partial', amount: 0.01, toAddress: PERSONAS[2].pubkey, toName: PERSONAS[2].name, caseKey: 'scenario.case.otc', icon: 'exchange', stepLeft: 'scenario.step.agreement', stepRight: 'scenario.step.confirmed', stepLeftIcon: 'handshake' },
+  { id: 'A', privacy: 'public', amount: 0.01, toAddress: PERSONAS[0].pubkey, toName: PERSONAS[0].name, caseKey: 'scenario.case.merchant', icon: 'store', stepRight: 'scenario.step.receipt' },
+  { id: 'B', privacy: 'private', amount: 0.01, toAddress: PERSONAS[1].pubkey, toName: PERSONAS[1].name, caseKey: 'scenario.case.salary', icon: 'building', stepRight: 'scenario.step.processed' },
+  { id: 'C', privacy: 'partial', amount: 0.01, toAddress: PERSONAS[2].pubkey, toName: PERSONAS[2].name, caseKey: 'scenario.case.otc', icon: 'exchange', stepRight: 'scenario.step.confirmed' },
 ]
 
 const TICK_MS = 30
@@ -94,11 +92,6 @@ const CHANNEL_ICONS = {
   exchange: ArrowLeftRight,
 }
 
-const STEP_ICONS = {
-  cart: ShoppingCart,
-  filetext: FileText,
-  handshake: Handshake,
-}
 
 export default function ScenarioPanel() {
   const { t } = useTranslation()

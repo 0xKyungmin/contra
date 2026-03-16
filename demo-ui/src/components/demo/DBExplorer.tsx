@@ -93,7 +93,6 @@ const PERSONA_ACCESS: Record<string, { tag: string; color: string; bg: string; b
 
 function PersonaSwitcher() {
   const { activePersona, selectPersona } = useAuthContext()
-  const { t } = useTranslation()
 
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', alignItems: 'center' }}>

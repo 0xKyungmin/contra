@@ -458,7 +458,7 @@ export default function PermissionPanel() {
         >
           <span>{t('perm.currentPermissions')}</span>
           {loading && (
-            <span style={{ color: 'var(--accent-blue)', fontWeight: '400' }}>{t('db.loading')}</span>
+            <span style={{ color: 'var(--accent-blue)', fontWeight: '400' }}>Loading...</span>
           )}
         </div>
         {error ? (
