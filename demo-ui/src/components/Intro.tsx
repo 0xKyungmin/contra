@@ -1,9 +1,5 @@
 import { useTranslation } from '../lib/i18n'
 
-function scrollTo(id: string) {
-  document.getElementById(id)?.scrollIntoView({ behavior: 'smooth' })
-}
-
 // Official Solana logo mark with gradient
 function SolanaLogo({ size = 20 }: { size?: number }) {
   const scale = size / 88

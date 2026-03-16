@@ -252,8 +252,6 @@ export default function ScenarioPanel() {
           {CHANNELS.map((ch) => {
             const s = S[ch.privacy]
             const pastNode = pct > 50
-            const coinBlur = pastNode && s.blur > 0 ? `blur(${s.blur}px)` : 'none'
-            const coinAlpha = pastNode ? s.alpha : 1
 
             return (
               <div key={ch.id} style={{ display: 'flex', alignItems: 'center', minHeight: '80px' }}>

@@ -1,4 +1,5 @@
-import initSqlJs, { type Database } from 'sql.js'
+import initSqlJs from 'sql.js'
+import type { Database } from 'sql.js'
 
 let db: Database | null = null
 
@@ -113,7 +114,7 @@ export function queryByTenant(database: Database, tenantPubkey: string): TxRow[]
   )
 
   if (results.length === 0) return []
-  return results[0].values.map((row) => ({
+  return results[0].values.map((row: unknown[]) => ({
     id: row[0] as number,
     channel_id: row[1] as string,
     privacy: row[2] as string,
@@ -138,7 +139,7 @@ export function queryAll(database: Database): TxRow[] {
   )
 
   if (results.length === 0) return []
-  return results[0].values.map((row) => ({
+  return results[0].values.map((row: unknown[]) => ({
     id: row[0] as number,
     channel_id: row[1] as string,
     privacy: row[2] as string,

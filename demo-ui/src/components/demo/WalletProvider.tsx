@@ -3,8 +3,7 @@ import { ConnectionProvider, WalletProvider as SolanaWalletProvider } from '@sol
 import { WalletModalProvider } from '@solana/wallet-adapter-react-ui'
 import { PhantomWalletAdapter } from '@solana/wallet-adapter-phantom'
 
-// Import wallet adapter styles
-import '@solana/wallet-adapter-react-ui/styles.css'
+// Wallet adapter styles loaded via CSS
 
 const GATEWAY_ENDPOINT = 'https://api.devnet.solana.com'
 
