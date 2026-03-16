@@ -222,7 +222,7 @@ export default function Intro() {
             style={{
               fontSize: '15px', lineHeight: '1.7',
               color: 'var(--text-secondary)', marginBottom: '40px',
-              maxWidth: '480px',
+              maxWidth: '480px', whiteSpace: 'pre-line',
             }}
           >
             {t('intro.subheadline')}

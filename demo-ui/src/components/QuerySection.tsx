@@ -33,31 +33,21 @@ export default function QuerySection() {
 
       <div style={{ maxWidth: '1200px', margin: '0 auto', position: 'relative' }}>
         {/* Section header */}
-        <div style={{ marginBottom: '40px' }}>
-          <p className="section-label" style={{ marginBottom: '10px' }}>
-            {t('query.label')}
+        <div style={{ marginBottom: '32px' }}>
+          <p style={{
+            fontSize: '10px', fontWeight: '600', letterSpacing: '0.18em',
+            textTransform: 'uppercase', color: 'var(--accent-cyan)',
+            fontFamily: 'var(--font-mono)', marginBottom: '10px',
+          }}>
+            {t('db.sectionLabel')}
           </p>
-          <h2
-            style={{
-              fontSize: 'clamp(20px, 2.5vw, 30px)',
-              fontWeight: '700',
-              letterSpacing: '-0.025em',
-              marginBottom: '8px',
-            }}
-          >
-            {t('query.title')}
+          <h2 style={{
+            fontSize: 'clamp(20px, 2.5vw, 28px)',
+            fontWeight: '700', letterSpacing: '-0.025em',
+            fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif',
+          }}>
+            {t('db.sectionTitle')}
           </h2>
-          <p
-            style={{
-              color: 'var(--text-secondary)',
-              fontSize: '13px',
-              maxWidth: '440px',
-              lineHeight: '1.7',
-              letterSpacing: '0.01em',
-            }}
-          >
-            {t('query.subtitle')}
-          </p>
         </div>
 
         {/* Permission panel (admin only - renders null for non-admin) */}

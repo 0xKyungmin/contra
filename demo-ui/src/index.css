@@ -13,8 +13,6 @@
   --accent-blue: #3b82f6;
   --accent-purple: #8b5cf6;
   --accent-cyan: #06b6d4;
-  --glow-blue: rgba(59, 130, 246, 0.15);
-  --glow-purple: rgba(139, 92, 246, 0.15);
   --header-bg: rgba(7, 7, 13, 0.90);
   --font-mono: 'IBM Plex Mono', 'JetBrains Mono', 'Fira Code', monospace;
 }
@@ -31,8 +29,6 @@
   --accent-blue: #3b82f6;
   --accent-purple: #8b5cf6;
   --accent-cyan: #06b6d4;
-  --glow-blue: rgba(59, 130, 246, 0.12);
-  --glow-purple: rgba(139, 92, 246, 0.12);
   --header-bg: rgba(255, 255, 255, 0.92);
   --font-mono: 'IBM Plex Mono', 'JetBrains Mono', 'Fira Code', monospace;
 }
@@ -55,21 +51,6 @@ body {
   -moz-osx-font-smoothing: grayscale;
   line-height: 1.6;
   transition: background-color 0.2s ease, color 0.2s ease;
-}
-
-.gradient-text {
-  background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-}
-
-.glow-blue {
-  box-shadow: 0 0 40px var(--glow-blue);
-}
-
-.glow-purple {
-  box-shadow: 0 0 40px var(--glow-purple);
 }
 
 .card {
@@ -103,33 +84,6 @@ body {
   transform: translateY(-1px);
 }
 
-.btn-secondary {
-  background: transparent;
-  color: var(--text-primary);
-  border: 1px solid var(--border-accent);
-  border-radius: 6px;
-  padding: 10px 24px;
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: border-color 0.2s ease, background 0.2s ease;
-  font-family: var(--font-mono);
-}
-
-.btn-secondary:hover {
-  border-color: var(--accent-blue);
-  background: rgba(59, 130, 246, 0.06);
-}
-
-.section-label {
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--accent-cyan);
-  font-family: var(--font-mono);
-}
-
 @keyframes fade-in-up {
   from {
     opacity: 0;
@@ -147,40 +101,13 @@ body {
 
 .delay-100 { animation-delay: 0.1s; opacity: 0; }
 .delay-200 { animation-delay: 0.2s; opacity: 0; }
-.delay-300 { animation-delay: 0.3s; opacity: 0; }
-.delay-400 { animation-delay: 0.4s; opacity: 0; }
 
 @keyframes spin {
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }
 }
 
-/* Transaction flow: pulse traveling along connector line */
-@keyframes flowPulse {
-  0%   { left: -8px; opacity: 0; }
-  8%   { opacity: 1; }
-  92%  { opacity: 1; }
-  100% { left: calc(100% + 8px); opacity: 0; }
-}
-
-/* Stage node glow pulse when active */
-@keyframes stagePulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(6, 182, 212, 0); }
-  50%       { box-shadow: 0 0 0 6px rgba(6, 182, 212, 0.12); }
-}
-
-/* Scanline blink for active stage border */
-@keyframes borderGlow {
-  0%, 100% { border-color: rgba(6, 182, 212, 0.5); }
-  50%       { border-color: rgba(6, 182, 212, 1); }
-}
-
-@keyframes fadeIn {
-  from { opacity: 0; transform: translateY(4px); }
-  to   { opacity: 1; transform: translateY(0); }
-}
-
-/* Wallet adapter modal overrides — match dark theme */
+/* Wallet adapter modal overrides */
 .wallet-adapter-modal-wrapper {
   background: var(--bg-card) !important;
   border: 1px solid var(--border-accent) !important;

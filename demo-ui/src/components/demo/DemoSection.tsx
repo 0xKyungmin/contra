@@ -22,7 +22,11 @@ function DemoInner() {
         <div style={{ maxWidth: '1200px', margin: '0 auto', position: 'relative' }}>
           {/* Section header */}
           <div style={{ marginBottom: '32px' }}>
-            <p className="section-label" style={{ marginBottom: '10px' }}>
+            <p style={{
+              fontSize: '10px', fontWeight: '600', letterSpacing: '0.18em',
+              textTransform: 'uppercase', color: 'var(--accent-cyan)',
+              fontFamily: 'var(--font-mono)', marginBottom: '10px',
+            }}>
               {t('demo.label')}
             </p>
             <h2 style={{

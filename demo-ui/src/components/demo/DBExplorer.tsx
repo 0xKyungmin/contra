@@ -14,19 +14,19 @@ const EXPLORER_CLUSTER = '?cluster=devnet'
 const PRIVACY_COLORS = {
   public:  '#4ade80',
   private: '#94a3b8',
-  partial: '#f59e0b',
+  partial: '#06b6d4',
 } as const
 
 const PRIVACY_BG = {
   public:  'rgba(74,222,128,0.08)',
   private: 'rgba(148,163,184,0.06)',
-  partial: 'rgba(245,158,11,0.07)',
+  partial: 'rgba(6,182,212,0.07)',
 } as const
 
 const PRIVACY_BORDER = {
   public:  'rgba(74,222,128,0.3)',
   private: 'rgba(148,163,184,0.2)',
-  partial: 'rgba(245,158,11,0.25)',
+  partial: 'rgba(6,182,212,0.25)',
 } as const
 
 // ---------------------------------------------------------------------------
@@ -85,13 +85,21 @@ const tdStyle: React.CSSProperties = {
 // Persona Switcher
 // ---------------------------------------------------------------------------
 
+const PERSONA_ACCESS: Record<string, { tag: string; color: string; bg: string; border: string }> = {
+  alice: { tag: 'Ch.C Unauthorized', color: '#ef4444', bg: 'rgba(239,68,68,0.08)', border: 'rgba(239,68,68,0.2)' },
+  bob: { tag: 'Ch.C Unauthorized', color: '#ef4444', bg: 'rgba(239,68,68,0.08)', border: 'rgba(239,68,68,0.2)' },
+  carol: { tag: 'Ch.C Authorized', color: '#4ade80', bg: 'rgba(74,222,128,0.08)', border: 'rgba(74,222,128,0.2)' },
+}
+
 function PersonaSwitcher() {
   const { activePersona, selectPersona } = useAuthContext()
+  const { t } = useTranslation()
 
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', alignItems: 'center' }}>
       {PERSONAS.map((p) => {
         const isActive = activePersona?.id === p.id
+        const access = PERSONA_ACCESS[p.id]
         return (
           <button
             key={p.id}
@@ -106,9 +114,9 @@ function PersonaSwitcher() {
               fontWeight: isActive ? '700' : '500',
               cursor: 'pointer',
               fontFamily: 'inherit',
-              background: isActive ? 'rgba(255,255,255,0.08)' : 'var(--bg-secondary)',
+              background: isActive ? 'rgba(6,182,212,0.08)' : 'var(--bg-secondary)',
               border: isActive
-                ? '1px solid rgba(255,255,255,0.2)'
+                ? '1px solid rgba(6,182,212,0.35)'
                 : '1px solid var(--border-subtle)',
               color: isActive ? 'var(--text-primary)' : 'var(--text-muted)',
               transition: 'all 0.15s ease',
@@ -130,6 +138,18 @@ function PersonaSwitcher() {
             <span style={{ fontSize: '9px', fontWeight: '500', opacity: 0.65 }}>
               {p.role}
             </span>
+            {access && (
+              <span style={{
+                fontSize: '8px', fontWeight: '600',
+                color: access.color,
+                background: access.bg,
+                border: `1px solid ${access.border}`,
+                padding: '1px 6px', borderRadius: '3px',
+                whiteSpace: 'nowrap',
+              }}>
+                {access.tag}
+              </span>
+            )}
           </button>
         )
       })}
@@ -309,6 +329,18 @@ function GenericTable({
                   )
                 }
 
+                // Use case — translate i18n key
+                if (col === 'use_case' && val) {
+                  const translated = t(val as Parameters<typeof t>[0])
+                  return (
+                    <td key={col} style={{ ...tdStyle, whiteSpace: 'nowrap' }}>
+                      <span style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
+                        {translated}
+                      </span>
+                    </td>
+                  )
+                }
+
                 // Amount — USDC
                 if (col === 'amount' && raw !== null) {
                   return (
@@ -341,12 +373,11 @@ function GenericTable({
 
 export default function DBExplorer() {
   const { activePersona } = useAuthContext()
-  const { init, hasData, execRaw, total } = useDemoTx()
+  const { init, hasData, execRaw } = useDemoTx()
   const { t } = useTranslation()
 
   const [queryResult, setQueryResult] = useState<{ columns: string[]; values: (string | number | null)[][] } | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [totalCount, setTotalCount] = useState(0)
 
   // Init SQLite on mount
   useEffect(() => {
@@ -366,7 +397,6 @@ export default function DBExplorer() {
         setQueryResult({ columns: [], values: [] })
       }
       setError(null)
-      setTotalCount(total())
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Query failed')
       setQueryResult(null)
@@ -389,7 +419,6 @@ export default function DBExplorer() {
     }
   }, [pubkey, hasData]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const resultRowCount = queryResult?.values.length ?? 0
 
   return (
     <div className="card" style={{ overflow: 'hidden' }}>
@@ -439,7 +468,7 @@ export default function DBExplorer() {
           border: '1px solid var(--border-subtle)',
           borderRadius: '8px',
           overflow: 'hidden',
-          minHeight: '120px',
+          minHeight: hasData ? undefined : '120px',
         }}>
           {!hasData ? (
             <div style={{
@@ -503,21 +532,6 @@ export default function DBExplorer() {
           )}
         </div>
 
-        {/* Footer stats */}
-        {hasData && !error && queryResult && (
-          <div style={{
-            marginTop: '12px',
-            display: 'flex',
-            flexWrap: 'wrap',
-            alignItems: 'center',
-            gap: '8px',
-          }}>
-            <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
-              Showing <strong style={{ color: 'var(--text-secondary)' }}>{resultRowCount}</strong> row{resultRowCount !== 1 ? 's' : ''} of{' '}
-              <strong style={{ color: 'var(--text-secondary)' }}>{totalCount}</strong> total transactions
-            </span>
-          </div>
-        )}
       </div>
     </div>
   )

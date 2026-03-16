@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useCallback, type ReactNode } from 'react'
+import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from 'react'
 import { setAuth } from './api'
 
 export type AuthMode = 'demo' | 'phantom'
@@ -102,11 +102,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   // Initialize auth on mount
-  useState(() => {
+  useEffect(() => {
     if (activePersona) {
       setAuth({ type: 'apiKey', key: activePersona.apiKey })
     }
-  })
+  }, [])
 
   return (
     <AuthContext.Provider value={{

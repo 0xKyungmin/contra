@@ -255,25 +255,17 @@ export default function ScenarioPanel() {
 
             return (
               <div key={ch.id} style={{ display: 'flex', alignItems: 'center', minHeight: '80px' }}>
-                {/* Left step label */}
+                {/* Channel label */}
                 <div style={{
-                  flexShrink: 0, width: '66px',
-                  display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '2px',
+                  flexShrink: 0, width: '40px',
+                  display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
                   position: 'relative', zIndex: 6,
                 }}>
-                  <div style={{
-                    width: '28px', height: '28px', borderRadius: '8px',
-                    background: 'var(--bg-card)',
-                    border: '1px solid var(--border-subtle)',
-                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  }}>
-                    {(() => { const Icon = STEP_ICONS[ch.stepLeftIcon]; return <Icon size={14} color="var(--text-muted)" /> })()}
-                  </div>
                   <span style={{
-                    fontSize: '7px', fontWeight: '600', color: 'var(--text-muted)',
-                    whiteSpace: 'nowrap', textAlign: 'center',
+                    fontSize: '14px', fontWeight: '800', color: 'var(--text-primary)',
+                    letterSpacing: '-0.02em', lineHeight: '1',
                   }}>
-                    {t(ch.stepLeft as Parameters<typeof t>[0])}
+                    Ch.{ch.id}
                   </span>
                 </div>
 
@@ -293,7 +285,7 @@ export default function ScenarioPanel() {
                       src="/usdc.svg" width={22} height={22} alt=""
                       style={{
                         position: 'absolute', top: '50%',
-                        left: `${pct * 2}%`,
+                        left: `calc(${pct * 2}% - 28px)`,
                         transform: 'translate(-50%, -50%)',
                         transition: `left ${TICK_MS}ms linear`,
                         zIndex: 5, borderRadius: '50%',
@@ -320,7 +312,7 @@ export default function ScenarioPanel() {
                   </div>
                   <span style={{
                     fontSize: '9px', fontWeight: '700', color: s.node, whiteSpace: 'nowrap',
-                    lineHeight: '1.2',
+                    lineHeight: '1.2', textAlign: 'center',
                   }}>
                     {t(ch.caseKey as Parameters<typeof t>[0])}
                   </span>
@@ -426,79 +418,100 @@ export default function ScenarioPanel() {
                       </>
                     ) : (
                       /* C: split view - authorized vs unauthorized */
-                      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '2px' }}>
-                        {/* Authorized path */}
-                        <div style={{ display: 'flex', alignItems: 'center', height: '32px' }}>
-                          <span style={{
-                            fontSize: '7px', fontWeight: '700', color: '#4ade80',
-                            whiteSpace: 'nowrap', flexShrink: 0, width: '36px', textAlign: 'right',
-                            paddingRight: '4px',
-                          }}>
-                            {t('scenario.permissionRequired' as Parameters<typeof t>[0])}
-                          </span>
-                          <div style={{
-                            flex: 1, position: 'relative', height: '100%',
-                            display: 'flex', alignItems: 'center',
-                          }}>
+                      <>
+                        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                          {/* Authorized path */}
+                          <div style={{ display: 'flex', alignItems: 'center', height: '32px' }}>
+                            <span style={{
+                              fontSize: '8px', fontWeight: '700', color: '#4ade80',
+                              whiteSpace: 'nowrap', flexShrink: 0, width: '48px', textAlign: 'right',
+                              paddingRight: '6px',
+                            }}>
+                              {t('scenario.permissionRequired' as Parameters<typeof t>[0])}
+                            </span>
                             <div style={{
-                              position: 'absolute', top: '50%', left: 0, right: 0, height: '1.5px',
-                              background: `repeating-linear-gradient(90deg, #4ade80 0, #4ade80 6px, transparent 6px, transparent 12px)`,
-                              opacity: 0.4,
-                              transform: 'translateY(-50%)',
-                            }} />
-                            {progress >= 0 && pct > 50 && (
-                              <img
-                                src="/usdc.svg" width={16} height={16} alt=""
-                                style={{
-                                  position: 'absolute', top: '50%',
-                                  left: `${(pct - 50) * 2}%`,
-                                  transform: 'translate(-50%, -50%)',
-                                  transition: `left ${TICK_MS}ms linear`,
-                                  zIndex: 5, borderRadius: '50%',
-                                  filter: 'drop-shadow(0 1px 3px rgba(0,0,0,0.15))',
-                                }}
-                              />
-                            )}
+                              flex: 1, position: 'relative', height: '100%',
+                              display: 'flex', alignItems: 'center',
+                            }}>
+                              <div style={{
+                                position: 'absolute', top: '50%', left: 0, right: 0, height: '1.5px',
+                                background: `repeating-linear-gradient(90deg, #4ade80 0, #4ade80 6px, transparent 6px, transparent 12px)`,
+                                opacity: 0.4,
+                                transform: 'translateY(-50%)',
+                              }} />
+                              {progress >= 0 && pct > 50 && (
+                                <img
+                                  src="/usdc.svg" width={16} height={16} alt=""
+                                  style={{
+                                    position: 'absolute', top: '50%',
+                                    left: `${(pct - 50) * 2}%`,
+                                    transform: 'translate(-50%, -50%)',
+                                    transition: `left ${TICK_MS}ms linear`,
+                                    zIndex: 5, borderRadius: '50%',
+                                    filter: 'drop-shadow(0 1px 3px rgba(0,0,0,0.15))',
+                                  }}
+                                />
+                              )}
+                            </div>
                           </div>
-                          <CheckCircle2 size={12} color={isDone ? '#4ade80' : 'var(--text-muted)'} style={{ flexShrink: 0, marginLeft: '4px' }} />
-                        </div>
-                        {/* Unauthorized path */}
-                        <div style={{ display: 'flex', alignItems: 'center', height: '32px' }}>
-                          <span style={{
-                            fontSize: '7px', fontWeight: '700', color: '#ef4444',
-                            whiteSpace: 'nowrap', flexShrink: 0, width: '36px', textAlign: 'right',
-                            paddingRight: '4px',
-                          }}>
-                            {t('scenario.hiddenFromOthers' as Parameters<typeof t>[0])}
-                          </span>
-                          <div style={{
-                            flex: 1, position: 'relative', height: '100%',
-                            display: 'flex', alignItems: 'center',
-                          }}>
+                          {/* Unauthorized path */}
+                          <div style={{ display: 'flex', alignItems: 'center', height: '32px' }}>
+                            <span style={{
+                              fontSize: '8px', fontWeight: '700', color: '#ef4444',
+                              whiteSpace: 'nowrap', flexShrink: 0, width: '48px', textAlign: 'right',
+                              paddingRight: '6px',
+                            }}>
+                              {t('scenario.hiddenFromOthers' as Parameters<typeof t>[0])}
+                            </span>
                             <div style={{
-                              position: 'absolute', top: '50%', left: 0, right: 0, height: '1.5px',
-                              background: `repeating-linear-gradient(90deg, #ef4444 0, #ef4444 6px, transparent 6px, transparent 12px)`,
-                              opacity: 0.2,
-                              transform: 'translateY(-50%)',
-                            }} />
-                            {progress >= 0 && pct > 50 && (
-                              <img
-                                src="/usdc.svg" width={16} height={16} alt=""
-                                style={{
-                                  position: 'absolute', top: '50%',
-                                  left: `${(pct - 50) * 2}%`,
-                                  transform: 'translate(-50%, -50%)',
-                                  transition: `left ${TICK_MS}ms linear, filter 0.4s ease, opacity 0.4s ease`,
-                                  filter: 'blur(5px) drop-shadow(0 1px 3px rgba(0,0,0,0.15))',
-                                  opacity: pastNode ? 0.1 : 1,
-                                  zIndex: 5, borderRadius: '50%',
-                                }}
-                              />
-                            )}
+                              flex: 1, position: 'relative', height: '100%',
+                              display: 'flex', alignItems: 'center',
+                            }}>
+                              <div style={{
+                                position: 'absolute', top: '50%', left: 0, right: 0, height: '1.5px',
+                                background: `repeating-linear-gradient(90deg, #ef4444 0, #ef4444 6px, transparent 6px, transparent 12px)`,
+                                opacity: 0.2,
+                                transform: 'translateY(-50%)',
+                              }} />
+                              {progress >= 0 && pct > 50 && (
+                                <img
+                                  src="/usdc.svg" width={16} height={16} alt=""
+                                  style={{
+                                    position: 'absolute', top: '50%',
+                                    left: `${(pct - 50) * 2}%`,
+                                    transform: 'translate(-50%, -50%)',
+                                    transition: `left ${TICK_MS}ms linear, filter 0.4s ease, opacity 0.4s ease`,
+                                    filter: 'blur(5px) drop-shadow(0 1px 3px rgba(0,0,0,0.15))',
+                                    opacity: pastNode ? 0.1 : 1,
+                                    zIndex: 5, borderRadius: '50%',
+                                  }}
+                                />
+                              )}
+                            </div>
                           </div>
-                          <CheckCircle2 size={12} color={isDone ? '#ef4444' : 'var(--text-muted)'} style={{ flexShrink: 0, marginLeft: '4px', opacity: 0.4 }} />
                         </div>
-                      </div>
+                        {/* End step label - matching A/B layout */}
+                        <div style={{
+                          flexShrink: 0, width: '66px',
+                          display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '2px',
+                          position: 'relative', zIndex: 6,
+                        }}>
+                          <div style={{
+                            width: '28px', height: '28px', borderRadius: '8px',
+                            background: 'var(--bg-card)',
+                            border: '1px solid var(--border-subtle)',
+                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          }}>
+                            <CheckCircle2 size={14} color={isDone ? '#4ade80' : 'var(--text-muted)'} />
+                          </div>
+                          <span style={{
+                            fontSize: '7px', fontWeight: '600', color: isDone ? '#4ade80' : 'var(--text-muted)',
+                            whiteSpace: 'nowrap', textAlign: 'center',
+                          }}>
+                            {t(ch.stepRight as Parameters<typeof t>[0])}
+                          </span>
+                        </div>
+                      </>
                     )}
                   </div>
                 ) : (
@@ -665,11 +678,11 @@ export default function ScenarioPanel() {
                         </span>
                         {ch.privacy === 'partial' && (
                           <span style={{
-                            fontSize: '9px', fontWeight: '600', color: '#f59e0b',
+                            fontSize: '9px', fontWeight: '600', color: 'var(--accent-cyan)',
                             whiteSpace: 'nowrap', flexShrink: 0,
-                            background: 'rgba(245,158,11,0.08)',
+                            background: 'rgba(6,182,212,0.08)',
                             padding: '2px 8px', borderRadius: '4px',
-                            border: '1px solid rgba(245,158,11,0.2)',
+                            border: '1px solid rgba(6,182,212,0.2)',
                           }}>
                             {t('scenario.partialHint')}
                           </span>
