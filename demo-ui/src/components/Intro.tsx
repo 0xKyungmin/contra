@@ -90,28 +90,44 @@ function HowItWorksDiagram() {
         </div>
       </div>
 
-      {/* Deposit / Withdraw arrows */}
-      <div style={{ display: 'flex', justifyContent: 'center', gap: '12px', alignItems: 'center' }}>
+      {/* Escrow Program wrapper */}
+      <div style={{
+        border: '1.5px dashed var(--border-accent)',
+        borderRadius: '10px',
+        padding: '10px 16px',
+        position: 'relative',
+      }}>
         <div style={{
-          display: 'flex', alignItems: 'center', gap: '4px',
-          fontSize: '10px', fontWeight: '600', color: 'var(--text-muted)',
-          letterSpacing: '0.04em', textTransform: 'uppercase',
+          position: 'absolute', top: '-8px', left: '50%', transform: 'translateX(-50%)',
+          padding: '1px 10px', borderRadius: '4px',
+          background: 'var(--bg-primary)',
+          fontSize: '8px', fontWeight: '700', letterSpacing: '0.08em',
+          color: 'var(--text-muted)', textTransform: 'uppercase', whiteSpace: 'nowrap',
         }}>
-          <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-            <path d="M5 2v6M2.5 5.5L5 8l2.5-2.5" stroke="var(--accent-cyan)" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-          Deposit
+          Escrow Program
         </div>
-        <div style={{ width: '1px', height: '12px', background: 'var(--border-subtle)' }} />
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: '4px',
-          fontSize: '10px', fontWeight: '600', color: 'var(--text-muted)',
-          letterSpacing: '0.04em', textTransform: 'uppercase',
-        }}>
-          <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-            <path d="M5 8V2M2.5 4.5L5 2l2.5 2.5" stroke="var(--accent-purple)" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-          Withdraw
+        <div style={{ display: 'flex', justifyContent: 'center', gap: '12px', alignItems: 'center' }}>
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: '4px',
+            fontSize: '10px', fontWeight: '600', color: 'var(--text-muted)',
+            letterSpacing: '0.04em', textTransform: 'uppercase',
+          }}>
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+              <path d="M5 2v6M2.5 5.5L5 8l2.5-2.5" stroke="var(--accent-cyan)" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            Deposit
+          </div>
+          <div style={{ width: '1px', height: '12px', background: 'var(--border-subtle)' }} />
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: '4px',
+            fontSize: '10px', fontWeight: '600', color: 'var(--text-muted)',
+            letterSpacing: '0.04em', textTransform: 'uppercase',
+          }}>
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+              <path d="M5 8V2M2.5 4.5L5 2l2.5 2.5" stroke="var(--accent-purple)" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            Withdraw
+          </div>
         </div>
       </div>
 
@@ -122,7 +138,8 @@ function HowItWorksDiagram() {
         padding: '16px',
         background: 'var(--bg-secondary)',
       }}>
-        <div style={{ fontSize: '12px', fontWeight: '700', marginBottom: '12px', letterSpacing: '-0.01em' }}>
+        <div style={{ fontSize: '12px', fontWeight: '700', marginBottom: '12px', letterSpacing: '-0.01em', display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <img src="/favicon.svg" width={14} height={14} alt="" style={{ borderRadius: '3px' }} />
           Contra Payment Channel
         </div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
