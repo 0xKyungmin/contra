@@ -595,7 +595,7 @@ export default function ScenarioPanel() {
 
       {/* ===== Tx Results ===== */}
       {isDone && Object.keys(results).length > 0 && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', overflowX: 'auto' }}>
           <span style={{
             fontSize: '10px', fontWeight: '600', letterSpacing: '0.12em',
             textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: '2px',
@@ -609,7 +609,7 @@ export default function ScenarioPanel() {
             return (
               <div key={ch.id} style={{
                 display: 'flex', alignItems: 'center', gap: '10px',
-                padding: '10px 14px', borderRadius: '8px',
+                padding: '10px 14px', borderRadius: '8px', minWidth: 'fit-content',
                 background: r?.error ? 'rgba(239,68,68,0.04)' : 'var(--bg-card)',
                 border: `1px solid ${r?.error ? 'rgba(239,68,68,0.2)' : 'var(--border-subtle)'}`,
               }}>
