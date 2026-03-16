@@ -29,6 +29,7 @@ export default function Header() {
       }}
     >
       <div
+        className="header-inner"
         style={{
           maxWidth: '1200px',
           margin: '0 auto',
@@ -72,7 +73,7 @@ export default function Header() {
         </div>
 
         {/* Nav */}
-        <nav style={{ display: 'flex', alignItems: 'center', gap: '28px' }}>
+        <nav className="header-nav" style={{ display: 'flex', alignItems: 'center', gap: '28px' }}>
           {navItems.map((item) => (
             <a
               key={item.key}

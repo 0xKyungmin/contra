@@ -9,6 +9,7 @@ export default function QuerySection() {
   return (
     <section
       id="query"
+      className="section-query"
       style={{
         padding: '80px 24px 100px',
         borderTop: '1px solid var(--border-subtle)',

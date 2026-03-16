@@ -195,7 +195,7 @@ export default function ScenarioPanel() {
   const pct = Math.max(0, Math.min(progress, 100))
 
   return (
-    <div className="card" style={{ padding: '28px', display: 'flex', flexDirection: 'column', gap: '24px' }}>
+    <div className="card scenario-card-inner" style={{ padding: '28px', display: 'flex', flexDirection: 'column', gap: '24px' }}>
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
         <div>
@@ -212,9 +212,9 @@ export default function ScenarioPanel() {
       </div>
 
       {/* ===== Flow Visualization ===== */}
-      <div style={{
+      <div className="flow-scroll-wrapper" style={{ borderRadius: '12px', border: '1px solid var(--border-subtle)' }}>
+      <div className="flow-scroll-inner" style={{
         background: 'var(--bg-secondary)', borderRadius: '12px',
-        border: '1px solid var(--border-subtle)',
         padding: '32px 20px',
         display: 'flex', alignItems: 'stretch',
       }}>
@@ -590,6 +590,7 @@ export default function ScenarioPanel() {
             SETTLE{'\n'}L1
           </span>
         </div>
+      </div>
       </div>
 
       {/* ===== Tx Results ===== */}

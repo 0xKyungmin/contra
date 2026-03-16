@@ -132,3 +132,53 @@ body {
 .wallet-adapter-modal-list li:hover {
   background: var(--bg-card) !important;
 }
+
+/* ============================================================
+   Mobile responsive overrides (max-width: 640px)
+   Desktop layout is untouched above this block.
+   ============================================================ */
+@media (max-width: 640px) {
+  /* Hide nav links on mobile — logo + controls remain */
+  .header-nav {
+    display: none !important;
+  }
+
+  /* Section padding reduction */
+  .section-intro {
+    padding: 40px 16px 40px !important;
+  }
+
+  .section-demo {
+    padding: 40px 16px 36px !important;
+  }
+
+  .section-query {
+    padding: 40px 16px 56px !important;
+  }
+
+  /* Header inner padding */
+  .header-inner {
+    padding: 0 16px !important;
+  }
+
+  /* Flow viz: horizontally scrollable on mobile */
+  .flow-scroll-wrapper {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .flow-scroll-inner {
+    min-width: 700px;
+  }
+
+  /* Intro: stack diagram below text on small screens */
+  .intro-diagram {
+    flex: 0 1 100% !important;
+    max-width: 100% !important;
+  }
+
+  /* Reduce card inner padding on mobile */
+  .scenario-card-inner {
+    padding: 16px !important;
+  }
+}

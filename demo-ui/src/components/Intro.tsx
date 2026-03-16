@@ -175,6 +175,7 @@ export default function Intro() {
   return (
     <section
       id="intro"
+      className="section-intro"
       style={{
         position: 'relative',
         overflow: 'hidden',
@@ -250,7 +251,7 @@ export default function Intro() {
         </div>
 
         {/* Right: How Contra Works diagram */}
-        <div className="animate-fade-in-up delay-200" style={{ flex: '0 1 400px' }}>
+        <div className="animate-fade-in-up delay-200 intro-diagram" style={{ flex: '0 1 400px' }}>
           <HowItWorksDiagram />
         </div>
       </div>

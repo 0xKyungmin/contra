@@ -12,6 +12,7 @@ function DemoInner() {
     <>
       <section
         id="demo"
+        className="section-demo"
         style={{
           padding: '72px 24px 60px',
           borderTop: '1px solid var(--border-subtle)',
