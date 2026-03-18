@@ -43,32 +43,33 @@ function HowItWorksDiagram() {
   const { t } = useTranslation()
   return (
     <div style={{
-      border: '1px solid var(--border-subtle)',
-      borderRadius: '16px',
       padding: '24px',
-      background: 'var(--bg-card)',
       display: 'flex',
       flexDirection: 'column',
       gap: '16px',
       maxWidth: '400px',
       width: '100%',
     }}>
-      {/* Mainnet header */}
+      {/* Solana Mainnet wrapper — contains everything */}
       <div style={{
-        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-        padding: '12px 16px',
         border: '1px solid var(--border-subtle)',
-        borderRadius: '10px',
+        borderRadius: '12px',
+        padding: '16px',
         background: 'var(--bg-secondary)',
+        display: 'flex', flexDirection: 'column', gap: '14px',
       }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <SolanaLogo size={14} />
-          <span style={{ fontSize: '13px', fontWeight: '700' }}>Mainnet</span>
+        {/* Mainnet header */}
+        <div style={{
+          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <SolanaLogo size={14} />
+            <span style={{ fontSize: '13px', fontWeight: '700' }}>Mainnet</span>
+          </div>
+          <span style={{ fontSize: '11px', color: 'var(--text-muted)', fontWeight: '500' }}>
+            $100B+ Liquidity
+          </span>
         </div>
-        <span style={{ fontSize: '11px', color: 'var(--text-muted)', fontWeight: '500' }}>
-          $100B+ Liquidity
-        </span>
-      </div>
 
       {/* User Wallet */}
       <div style={{ display: 'flex', justifyContent: 'center' }}>
@@ -165,6 +166,7 @@ function HowItWorksDiagram() {
           ))}
         </div>
       </div>
+      </div>{/* close Solana Mainnet wrapper */}
     </div>
   )
 }
