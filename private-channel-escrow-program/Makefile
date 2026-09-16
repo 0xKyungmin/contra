@@ -7,7 +7,7 @@ PROGRAM_KEYPAIR := ../target/deploy/private_channel_escrow_program-keypair.json
 PROGRAM_ENV_KEY := ESCROW_PROGRAM_ID
 
 .PHONY: install build build-test build-no-clients build-hook-fixture fmt generate-idl generate-clients
-.PHONY: unit-test integration-test integration-test-no-build all-test
+.PHONY: unit-test integration-test integration-test-no-build all-test fuzz
 .PHONY: unit-coverage coverage-html all-coverage
 .PHONY: build-localnet build-devnet deploy-devnet
 
@@ -78,6 +78,17 @@ integration-test-no-build:
 integration-test: build integration-test-no-build
 
 all-test: unit-test integration-test
+
+# Run the Trident fuzz harnesses. Separate cargo workspace, so it builds on its
+# own; needs ../target/deploy/*.so and clients/rust from a prior build.
+# Each run picks a random master seed and prints it, so a failure replays with
+# TRIDENT_FUZZ_DEBUG=<seed>.
+# TRIDENT_WITH_EXIT_CODE is required: Trident catches failed asserts, prints them
+# and exits 0 otherwise, so the harnesses can never fail CI without it.
+fuzz:
+	@echo "Running fuzz harnesses for escrow program..."
+	@cd tests/trident-tests && TRIDENT_WITH_EXIT_CODE=1 cargo run --locked --bin fuzz_escrow
+	@cd tests/trident-tests && TRIDENT_WITH_EXIT_CODE=1 cargo run --locked --bin fuzz_rotate_bitmap
 
 # Run unit tests with coverage
 unit-coverage:

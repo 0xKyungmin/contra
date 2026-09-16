@@ -86,6 +86,7 @@ jobs:
       rust_checks: ${{ steps.filter.outputs.rust_checks }}
       integration: ${{ steps.filter.outputs.integration }}
       core_indexer: ${{ steps.filter.outputs.core_indexer }}
+      trident: ${{ steps.filter.outputs.trident }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -136,6 +137,16 @@ jobs:
               - 'auth/**'
               # Re-vendoring the DvP client runs its tests via ci-unit-coverage.
               - 'dvp-swap-program/**'
+            trident:
+              # The escrow client takes borsh/thiserror/num-* from the root
+              # manifest and the harnesses build on the root toolchain, so a
+              # root-only change can break the fuzz build.
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.github/workflows/rust.yml'
+              - '.github/actions/setup-environment/**'
+              - 'private-channel-escrow-program/**'
 
   build-artifacts:
     name: Build Shared Artifacts
@@ -439,3 +450,45 @@ jobs:
           lcov-file: coverage/coverage-auth-unit.lcov
           artifact-name: rust-unit-coverage-reports
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+  fuzz-tests:
+    name: Escrow Fuzz (Trident)
+    # Depends on integration-tests for ordering, not for its result: fuzzing
+    # saturates the runner, and the indexer chaos test confirms releases within
+    # a ~2s window, so the two must not share a box. `!cancelled()` keeps fuzz
+    # running when integration-tests fails or is skipped.
+    needs: [changes, build-artifacts, integration-tests]
+    if: >-
+      !cancelled() && needs.changes.outputs.trident == 'true' &&
+      needs.build-artifacts.result == 'success'
+    runs-on: private-channel-runner-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-environment
+        with:
+          setup-node: "false"
+          setup-pnpm: "false"
+          install-dependencies: "false"
+          install-base-cargo-tools: "false"
+          setup-solana: "false"
+          build-programs: "false"
+          # Separate cargo project, so it builds into its own target/ that the
+          # default `. -> target` workspace never sees.
+          rust-cache-workspaces: |
+            . -> target
+            private-channel-escrow-program/tests/trident-tests -> target
+
+      # The harnesses load the .so named in Trident.toml and link the generated
+      # Rust client, both of which the tarball already carries.
+      - name: Download shared artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-build-artifacts
+
+      - name: Restore shared artifacts
+        run: tar -xzf ci-build-artifacts.tgz
+
+      - name: Run fuzz harnesses
+        run: make -C private-channel-escrow-program fuzz
