@@ -73,15 +73,23 @@ impl AccountsDB {
         super::get_transaction::get_transaction(self, signature).await
     }
 
+    /// `slot_ranges` restricts the page to those inclusive slot windows, or
+    /// `None` for the whole history. It can only narrow a result.
     pub async fn get_signatures_for_address(
         &self,
         address: &Pubkey,
         limit: usize,
         before: Option<&Signature>,
         until: Option<&Signature>,
+        slot_ranges: Option<&[(i64, i64)]>,
     ) -> Result<Vec<RpcConfirmedTransactionStatusWithSignature>> {
         super::get_signatures_for_address::get_signatures_for_address(
-            self, address, limit, before, until,
+            self,
+            address,
+            limit,
+            before,
+            until,
+            slot_ranges,
         )
         .await
     }
@@ -1141,7 +1149,7 @@ mod tests {
         flush_address_signatures_sync(&db, &addr_sig_rows).await;
 
         let results = db
-            .get_signatures_for_address(&from.pubkey(), 10, None, None)
+            .get_signatures_for_address(&from.pubkey(), 10, None, None, None)
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -1154,7 +1162,7 @@ mod tests {
     async fn get_signatures_for_address_empty() {
         let (db, _pg) = start_test_postgres().await;
         let results = db
-            .get_signatures_for_address(&Pubkey::new_unique(), 10, None, None)
+            .get_signatures_for_address(&Pubkey::new_unique(), 10, None, None, None)
             .await
             .unwrap();
         assert!(results.is_empty());
@@ -1210,7 +1218,7 @@ mod tests {
         flush_address_signatures_sync(&db, &addr_sig_rows).await;
 
         let results = db
-            .get_signatures_for_address(&to, 10, None, None)
+            .get_signatures_for_address(&to, 10, None, None, None)
             .await
             .unwrap();
 
@@ -1276,6 +1284,50 @@ mod tests {
         sig
     }
 
+    /// Scoping runs in the query, so `limit` counts rows the caller may see.
+    /// Filtering the page afterwards would hand back one row here and no cursor
+    /// to reach the other.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_signatures_for_address_limit_counts_scoped_rows() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let to = Pubkey::new_unique();
+
+        let sig_oldest = store_tx_at_slot(&mut db, &to, 10).await;
+        // Slots 20 and 30 belong to a window the caller does not own.
+        store_tx_at_slot(&mut db, &to, 20).await;
+        store_tx_at_slot(&mut db, &to, 30).await;
+        let sig_newest = store_tx_at_slot(&mut db, &to, 40).await;
+
+        let results = db
+            .get_signatures_for_address(&to, 2, None, None, Some(&[(0, 19), (31, i64::MAX)]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|entry| entry.signature.clone())
+                .collect::<Vec<_>>(),
+            vec![sig_newest.to_string(), sig_oldest.to_string()]
+        );
+    }
+
+    /// An empty scope is not an absent one: the caller owns no window, so the
+    /// page is empty rather than whole.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_signatures_for_address_empty_scope_returns_nothing() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let to = Pubkey::new_unique();
+        store_tx_at_slot(&mut db, &to, 10).await;
+
+        let results = db
+            .get_signatures_for_address(&to, 10, None, None, Some(&[]))
+            .await
+            .unwrap();
+
+        assert!(results.is_empty());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn get_signatures_for_address_before_cursor() {
         let (mut db, _pg) = start_test_postgres().await;
@@ -1288,7 +1340,7 @@ mod tests {
 
         // `before=sig_mid` must return only the transaction older than sig_mid (slot 10).
         let results = db
-            .get_signatures_for_address(&to, 10, Some(&sig_mid), None)
+            .get_signatures_for_address(&to, 10, Some(&sig_mid), None, None)
             .await
             .unwrap();
 
@@ -1309,7 +1361,7 @@ mod tests {
         // `until=sig_mid` must return transactions from newest down to and
         // including sig_mid (slots 30 and 20), but not slot 10.
         let results = db
-            .get_signatures_for_address(&to, 10, None, Some(&sig_mid))
+            .get_signatures_for_address(&to, 10, None, Some(&sig_mid), None)
             .await
             .unwrap();
 
@@ -1330,7 +1382,7 @@ mod tests {
         // Combining both cursors must return exactly sig_mid (slot 20):
         // older than slot 30 (before=sig_new) AND as recent as slot 20 (until=sig_mid).
         let results = db
-            .get_signatures_for_address(&to, 10, Some(&sig_new), Some(&sig_mid))
+            .get_signatures_for_address(&to, 10, Some(&sig_new), Some(&sig_mid), None)
             .await
             .unwrap();
 
@@ -1348,7 +1400,7 @@ mod tests {
         // should catch this and return Err instead of silently returning empty.
         let ghost_sig = solana_sdk::signature::Signature::new_unique();
         let result = db
-            .get_signatures_for_address(&to, 10, Some(&ghost_sig), None)
+            .get_signatures_for_address(&to, 10, Some(&ghost_sig), None, None)
             .await;
 
         assert!(result.is_err());
@@ -1366,7 +1418,7 @@ mod tests {
 
         let ghost_sig = solana_sdk::signature::Signature::new_unique();
         let result = db
-            .get_signatures_for_address(&to, 10, None, Some(&ghost_sig))
+            .get_signatures_for_address(&to, 10, None, Some(&ghost_sig), None)
             .await;
 
         assert!(result.is_err());
@@ -1431,11 +1483,11 @@ mod tests {
         flush_address_signatures_sync(&pg_db, &pg_addr_sig_rows).await;
 
         let pg_sigs = pg_db
-            .get_signatures_for_address(&to, 10, None, None)
+            .get_signatures_for_address(&to, 10, None, None, None)
             .await
             .unwrap();
         let cache_sigs = cache_db
-            .get_signatures_for_address(&to, 10, None, None)
+            .get_signatures_for_address(&to, 10, None, None, None)
             .await
             .unwrap();
 
@@ -1544,6 +1596,135 @@ mod tests {
         }
 
         assert_eq!(db.get_transaction_count().await.unwrap(), 2);
+    }
+
+    /// A landed `SetAuthority { AccountOwner }` handing `token_account` from
+    /// `owner` to `new_owner`. `status` decides whether it executed.
+    fn handoff_tx(
+        owner: &Keypair,
+        token_account: &Pubkey,
+        new_owner: &Pubkey,
+        status: Result<(), solana_sdk::transaction::TransactionError>,
+    ) -> (SanitizedTransaction, ProcessedTransaction) {
+        let instruction = spl_token::instruction::set_authority(
+            &spl_token::id(),
+            token_account,
+            Some(new_owner),
+            spl_token::instruction::AuthorityType::AccountOwner,
+            &owner.pubkey(),
+            &[],
+        )
+        .expect("set_authority builds");
+        let message = solana_sdk::message::Message::new(&[instruction], Some(&owner.pubkey()));
+        let transaction =
+            solana_sdk::transaction::Transaction::new(&[owner], message, Hash::default());
+        let sanitized = SanitizedTransaction::try_from_legacy_transaction(
+            transaction,
+            &std::collections::HashSet::new(),
+        )
+        .expect("sanitizes");
+
+        let processed = ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
+            loaded_transaction: LoadedTransaction {
+                accounts: vec![],
+                ..Default::default()
+            },
+            execution_details: TransactionExecutionDetails {
+                accounts_deltas: status.is_ok().then(crate::test_helpers::no_accounts_deltas),
+                status,
+                log_messages: None,
+                inner_instructions: None,
+                return_data: None,
+                executed_units: 0,
+            },
+            programs_modified_by_tx: HashMap::new(),
+        }));
+
+        (sanitized, processed)
+    }
+
+    /// The row gates what a later owner may read, so it has to be visible to
+    /// anything that can already see the block it arrived in — it commits with
+    /// the batch rather than after it, unlike the address index.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_account_owner_handoff_is_recorded_with_its_block() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let owner = Keypair::new();
+        let token_account = Pubkey::new_unique();
+        let new_owner = Pubkey::new_unique();
+        let slot = 9u64;
+
+        let txs = [handoff_tx(&owner, &token_account, &new_owner, Ok(()))];
+        let refs: Vec<_> = txs
+            .iter()
+            .map(|(tx, p)| (*tx.signature(), tx, slot, 1_700_000_000i64, p))
+            .collect();
+        db.write_batch(
+            &[],
+            refs,
+            Some(create_test_block_info(slot, Hash::new_unique())),
+        )
+        .await
+        .unwrap();
+
+        let AccountsDB::Postgres(ref postgres_db) = db else {
+            panic!("expected Postgres variant")
+        };
+        let (address, recorded_slot, prev_owner, recorded_new_owner): (
+            Vec<u8>,
+            i64,
+            Vec<u8>,
+            Vec<u8>,
+        ) = sqlx::query_as(
+            "SELECT address, slot, prev_owner, new_owner FROM token_account_owner_change",
+        )
+        .fetch_one(postgres_db.pool.as_ref())
+        .await
+        .unwrap();
+
+        assert_eq!(address, token_account.to_bytes().to_vec());
+        assert_eq!(recorded_slot, slot as i64);
+        assert_eq!(prev_owner, owner.pubkey().to_bytes().to_vec());
+        assert_eq!(recorded_new_owner, new_owner.to_bytes().to_vec());
+    }
+
+    /// A handoff that failed never moved the account. Recording one anyway would
+    /// cut the owner off from their own history on someone else's failed attempt.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_handoff_records_nothing() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let slot = 9u64;
+
+        let txs = [handoff_tx(
+            &Keypair::new(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            Err(solana_sdk::transaction::TransactionError::InstructionError(
+                0,
+                solana_sdk::instruction::InstructionError::Custom(1),
+            )),
+        )];
+        let refs: Vec<_> = txs
+            .iter()
+            .map(|(tx, p)| (*tx.signature(), tx, slot, 1_700_000_000i64, p))
+            .collect();
+        db.write_batch(
+            &[],
+            refs,
+            Some(create_test_block_info(slot, Hash::new_unique())),
+        )
+        .await
+        .unwrap();
+
+        let AccountsDB::Postgres(ref postgres_db) = db else {
+            panic!("expected Postgres variant")
+        };
+        let recorded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM token_account_owner_change")
+            .fetch_one(postgres_db.pool.as_ref())
+            .await
+            .unwrap();
+
+        assert_eq!(recorded, 0);
     }
 
     /// A handle on this database carrying a freshly claimed writer epoch.

@@ -186,6 +186,51 @@ async fn start_mock_backend_with_sequence(bodies: Vec<String>) -> SocketAddr {
     addr
 }
 
+/// Like `start_mock_backend_with_sequence`, but also records the body of every
+/// request it answers, so a test can assert on what the gateway forwarded
+/// rather than only on what came back.
+async fn start_recording_mock_backend(
+    bodies: Vec<String>,
+) -> (SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&requests);
+
+    tokio::spawn(async move {
+        let mut served = 0;
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 4096];
+            let read = stream.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..read]).to_string();
+            // Body follows the blank line that ends the headers.
+            if let Some((_, body)) = request.split_once("\r\n\r\n") {
+                recorded.lock().unwrap().push(body.to_string());
+            }
+            let body = &bodies[served.min(bodies.len() - 1)];
+            served += 1;
+            let resp = json_http_response(body);
+            let _ = stream.write_all(resp.as_bytes()).await;
+        }
+    });
+
+    (addr, requests)
+}
+
+/// The slot scope the gateway attached to the proxied history call, if any.
+fn forwarded_slot_ranges(
+    requests: &Arc<std::sync::Mutex<Vec<String>>>,
+) -> Option<serde_json::Value> {
+    let requests = requests.lock().unwrap();
+    // The ownership account fetch comes first; the proxied call is the last.
+    let last = requests.last()?;
+    let json: serde_json::Value = serde_json::from_str(last).ok()?;
+    json["params"]
+        .get(1)?
+        .get("privateChannelSlotRanges")
+        .cloned()
+}
+
 /// Start a gateway with auth enforcement enabled.
 ///
 /// `write_url` defaults to an unreachable port when not needed — most tests
@@ -303,6 +348,23 @@ fn token_account_response(owner_bytes: &[u8; 32], delegate_bytes: Option<&[u8; 3
     .to_string()
 }
 
+/// Where an untouched ATA of `owner` actually sits, for the all-zero mint
+/// `token_account_response` builds.
+///
+/// A test covering the no-handoff path has to use this rather than an arbitrary
+/// address: the gateway treats an address that does not derive from its own
+/// owner as one whose owner was moved without a row being recorded.
+fn untouched_ata_of(owner: &[u8; 32]) -> [u8; 32] {
+    let token_program =
+        solana_pubkey::Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+    spl_associated_token_account::get_associated_token_address_with_program_id(
+        &solana_pubkey::Pubkey::new_from_array(*owner),
+        &solana_pubkey::Pubkey::default(),
+        &token_program,
+    )
+    .to_bytes()
+}
+
 /// Build a getAccountInfo JSON-RPC response for a mint account (82 bytes, SPL
 /// Token program). Used to verify the gateway rejects mint queries for users.
 fn mint_account_response() -> String {
@@ -358,6 +420,114 @@ fn history_response() -> String {
         ]
     })
     .to_string()
+}
+
+/// Create the ledger table the gateway reads ownership handoffs from.
+///
+/// The core node owns this schema (`core/src/accounts/postgres.rs`) and creates
+/// it at startup. It is copied rather than imported so the gateway's tests don't
+/// build the node; keep the two in step.
+async fn init_owner_change_table(pool: &PgPool) {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS token_account_owner_change (
+            address    BYTEA  NOT NULL,
+            slot       BIGINT NOT NULL,
+            tx_index   INT    NOT NULL,
+            signature  BYTEA  NOT NULL,
+            prev_owner BYTEA  NOT NULL,
+            new_owner  BYTEA  NOT NULL,
+            PRIMARY KEY (address, slot, signature)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // The node writes both of these at startup. Without the watermark the
+    // gateway cannot tell an empty table from an unrecorded history, and
+    // refuses to serve any.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS metadata (key VARCHAR PRIMARY KEY, value BYTEA NOT NULL)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    set_owner_change_watermark(pool, 0).await;
+}
+
+/// Declare that handoffs are recorded from `slot` onward.
+async fn set_owner_change_watermark(pool: &PgPool, slot: i64) {
+    sqlx::query(
+        "INSERT INTO metadata (key, value) VALUES ('owner_change_indexed_from_slot', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(slot.to_be_bytes().to_vec())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Record `address` passing from `prev_owner` to `new_owner` at `slot`.
+///
+/// `tx_index` is the transaction's position in its block, and `signature_byte`
+/// controls where the row sorts by signature, so a test can make the two
+/// orderings disagree.
+async fn insert_owner_change(
+    pool: &PgPool,
+    address: &[u8; 32],
+    slot: i64,
+    tx_index: i32,
+    signature_byte: u8,
+    prev_owner: &[u8; 32],
+    new_owner: &[u8; 32],
+) {
+    sqlx::query(
+        "INSERT INTO token_account_owner_change
+             (address, slot, tx_index, signature, prev_owner, new_owner)
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(address.as_slice())
+    .bind(slot)
+    .bind(tx_index)
+    .bind(vec![signature_byte; 64])
+    .bind(prev_owner.as_slice())
+    .bind(new_owner.as_slice())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// A landed history page with one entry per slot, newest first as the node
+/// orders them.
+fn history_page_for_slots(slots: &[i64]) -> String {
+    let entries: Vec<serde_json::Value> = slots
+        .iter()
+        .rev()
+        .map(|slot| {
+            json!({
+                "signature": format!("sig{slot}"),
+                "slot": slot,
+                "err": null,
+                "memo": null,
+                "blockTime": null,
+                "confirmationStatus": "finalized"
+            })
+        })
+        .collect();
+
+    json!({"jsonrpc": "2.0", "id": 1, "result": entries}).to_string()
+}
+
+/// The signatures a history response came back with, in order.
+fn returned_signatures(body: &serde_json::Value) -> Vec<String> {
+    body["result"]
+        .as_array()
+        .expect("history page")
+        .iter()
+        .map(|entry| entry["signature"].as_str().unwrap().to_string())
+        .collect()
 }
 
 /// A getSignatureStatuses response carrying the same two probe errors, in the
@@ -1519,6 +1689,7 @@ async fn test_get_signatures_for_address_delegate_returns_403() {
 async fn test_get_signatures_for_address_token_account_owner_is_proxied() {
     let (pool, _url, _container) = start_postgres().await;
     db::init_schema(&pool).await.unwrap();
+    init_owner_change_table(&pool).await;
 
     let owner_bytes = [50u8; 32];
     let owner_pubkey = bs58::encode(owner_bytes).into_string();
@@ -1527,8 +1698,15 @@ async fn test_get_signatures_for_address_token_account_owner_is_proxied() {
     insert_wallet(&pool, user_id, &owner_pubkey).await;
     let token = generate_token(user_id, "user");
 
-    let ata_pubkey = bs58::encode([51u8; 32]).into_string();
-    let backend = start_mock_backend_with_body(token_account_response(&owner_bytes, None)).await;
+    // Its own derived address: an arbitrary one reads as an account whose owner
+    // was moved with no row recorded, which is served an empty page that a 200
+    // alone would not tell apart from this one.
+    let ata_pubkey = bs58::encode(untouched_ata_of(&owner_bytes)).into_string();
+    let (backend, requests) = start_recording_mock_backend(vec![
+        token_account_response(&owner_bytes, None),
+        history_page_for_slots(&[1]),
+    ])
+    .await;
     let addr = start_gateway(
         pool,
         "http://127.0.0.1:1".to_string(),
@@ -1550,6 +1728,11 @@ async fn test_get_signatures_for_address_token_account_owner_is_proxied() {
         .unwrap();
 
     assert_eq!(res.status(), 200);
+    assert_eq!(
+        forwarded_slot_ranges(&requests),
+        None,
+        "the owner of an account that never moved reads its history unscoped"
+    );
 }
 
 /// Approving a delegate must not cost the owner access to its own history.
@@ -1558,6 +1741,7 @@ async fn test_get_signatures_for_address_token_account_owner_is_proxied() {
 async fn test_get_signatures_for_address_owner_keeps_history_after_delegating() {
     let (pool, _url, _container) = start_postgres().await;
     db::init_schema(&pool).await.unwrap();
+    init_owner_change_table(&pool).await;
 
     let owner_bytes = [52u8; 32];
     let owner_pubkey = bs58::encode(owner_bytes).into_string();
@@ -1567,11 +1751,11 @@ async fn test_get_signatures_for_address_owner_keeps_history_after_delegating() 
     insert_wallet(&pool, user_id, &owner_pubkey).await;
     let token = generate_token(user_id, "user");
 
-    let ata_pubkey = bs58::encode([54u8; 32]).into_string();
-    let backend = start_mock_backend_with_body(token_account_response(
-        &owner_bytes,
-        Some(&unrelated_delegate),
-    ))
+    let ata_pubkey = bs58::encode(untouched_ata_of(&owner_bytes)).into_string();
+    let (backend, requests) = start_recording_mock_backend(vec![
+        token_account_response(&owner_bytes, Some(&unrelated_delegate)),
+        history_page_for_slots(&[1]),
+    ])
     .await;
     let addr = start_gateway(
         pool,
@@ -1594,6 +1778,11 @@ async fn test_get_signatures_for_address_owner_keeps_history_after_delegating() 
         .unwrap();
 
     assert_eq!(res.status(), 200);
+    assert_eq!(
+        forwarded_slot_ranges(&requests),
+        None,
+        "a delegate on the account must not narrow what its owner reads"
+    );
 }
 
 /// `getSignaturesForAddress` with an Operator JWT must be proxied for any address.
@@ -1680,6 +1869,374 @@ async fn test_get_signatures_for_address_user_gets_uniform_errors() {
         entries[2]["err"].is_null(),
         "a landed transaction keeps err: null"
     );
+}
+
+/// Taking ownership of a token account must not hand over the history the
+/// previous owner made with it. The handoff's own slot goes to neither party.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_excludes_slots_before_a_handoff() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+    init_owner_change_table(&pool).await;
+
+    let previous_owner = [1u8; 32];
+    let new_owner = [2u8; 32];
+    let token_account = [8u8; 32];
+    let handoff_slot = 2;
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &bs58::encode(new_owner).into_string()).await;
+    let token = generate_token(user_id, "user");
+    insert_owner_change(
+        &pool,
+        &token_account,
+        handoff_slot,
+        0,
+        handoff_slot as u8,
+        &previous_owner,
+        &new_owner,
+    )
+    .await;
+
+    // Ownership fetch shows the account is theirs now, then the proxied page.
+    let (backend, requests) = start_recording_mock_backend(vec![
+        token_account_response(&new_owner, None),
+        history_page_for_slots(&[3]),
+    ])
+    .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [bs58::encode(token_account).into_string()]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        forwarded_slot_ranges(&requests),
+        Some(json!([[handoff_slot + 1, i64::MAX]])),
+        "the node must be asked only for what landed after the handoff"
+    );
+}
+
+/// An account handed away and taken back leaves its owner both of their own
+/// windows, and none of the window in between.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_returns_both_windows_of_a_returning_owner() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+    init_owner_change_table(&pool).await;
+
+    let original_owner = [1u8; 32];
+    let interim_owner = [2u8; 32];
+    let token_account = [8u8; 32];
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &bs58::encode(original_owner).into_string()).await;
+    let token = generate_token(user_id, "user");
+    insert_owner_change(
+        &pool,
+        &token_account,
+        2,
+        0,
+        2,
+        &original_owner,
+        &interim_owner,
+    )
+    .await;
+    insert_owner_change(
+        &pool,
+        &token_account,
+        4,
+        0,
+        4,
+        &interim_owner,
+        &original_owner,
+    )
+    .await;
+
+    let (backend, requests) = start_recording_mock_backend(vec![
+        token_account_response(&original_owner, None),
+        history_page_for_slots(&[1, 5]),
+    ])
+    .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [bs58::encode(token_account).into_string()]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        forwarded_slot_ranges(&requests),
+        Some(json!([[0, 1], [5, i64::MAX]])),
+        "slot 3 belonged to the interim owner, and slots 2 and 4 are handoffs"
+    );
+}
+
+/// A ledger that already had blocks when it started recording handoffs cannot
+/// vouch for what happened before that. An empty table there means the rows were
+/// not being written yet, so the history below the watermark is withheld even
+/// from an account with no recorded handoff at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_withholds_history_below_the_watermark() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+    init_owner_change_table(&pool).await;
+
+    let owner = [1u8; 32];
+    let token_account = untouched_ata_of(&owner);
+    let recording_began = 500;
+    set_owner_change_watermark(&pool, recording_began).await;
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &bs58::encode(owner).into_string()).await;
+    let token = generate_token(user_id, "user");
+
+    let (backend, requests) = start_recording_mock_backend(vec![
+        token_account_response(&owner, None),
+        history_page_for_slots(&[600]),
+    ])
+    .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [bs58::encode(token_account).into_string()]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        forwarded_slot_ranges(&requests),
+        Some(json!([[recording_began, i64::MAX]])),
+        "slots before recording began cannot be attributed to anyone"
+    );
+}
+
+/// Two handoffs can land in one slot, and signature bytes say nothing about
+/// which ran first. Ordering by them would read this round trip backwards and
+/// silently cut the owner off from everything before it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_same_slot_handoffs_follow_execution_order() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+    init_owner_change_table(&pool).await;
+
+    let owner = [1u8; 32];
+    let interim_owner = [2u8; 32];
+    let token_account = [8u8; 32];
+    let slot = 100;
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &bs58::encode(owner).into_string()).await;
+    let token = generate_token(user_id, "user");
+
+    // Executed away-then-back, but given signatures that sort the other way.
+    insert_owner_change(&pool, &token_account, slot, 0, 0xff, &owner, &interim_owner).await;
+    insert_owner_change(&pool, &token_account, slot, 1, 0x11, &interim_owner, &owner).await;
+
+    let (backend, requests) = start_recording_mock_backend(vec![
+        token_account_response(&owner, None),
+        history_page_for_slots(&[1]),
+    ])
+    .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [bs58::encode(token_account).into_string()]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        forwarded_slot_ranges(&requests),
+        Some(json!([[0, slot - 1], [slot + 1, i64::MAX]])),
+        "the owner handed the account away and took it back, so both sides are theirs"
+    );
+}
+
+/// Handing an account on is free, and these rows are never deleted, so anyone
+/// who holds an account can churn its chain past the gateway's cap and hand it
+/// back. The cap bounds how far back the owner reads, so the windows after the
+/// churn are still theirs; only what the read did not reach is withheld.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_churned_chain_still_serves_the_newest_windows() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+    init_owner_change_table(&pool).await;
+
+    let owner = [1u8; 32];
+    let token_account = [8u8; 32];
+    let handback_slot = 66;
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &bs58::encode(owner).into_string()).await;
+    let token = generate_token(user_id, "user");
+
+    // The owner hands it on once, it is passed hand to hand past the cap of 64,
+    // and the last holder hands it back.
+    let mut holder = owner;
+    for slot in 1..handback_slot {
+        let mut next_holder = [0u8; 32];
+        next_holder[0] = slot as u8;
+        insert_owner_change(
+            &pool,
+            &token_account,
+            slot,
+            0,
+            slot as u8,
+            &holder,
+            &next_holder,
+        )
+        .await;
+        holder = next_holder;
+    }
+    insert_owner_change(
+        &pool,
+        &token_account,
+        handback_slot,
+        0,
+        handback_slot as u8,
+        &holder,
+        &owner,
+    )
+    .await;
+
+    let (backend, requests) = start_recording_mock_backend(vec![
+        token_account_response(&owner, None),
+        history_page_for_slots(&[1]),
+    ])
+    .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [bs58::encode(token_account).into_string()]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        forwarded_slot_ranges(&requests),
+        Some(json!([[handback_slot + 1, i64::MAX]])),
+        "churn below the cap must not cost the owner the window they hold now"
+    );
+}
+
+/// An address that never changed hands is not scoped at all, so an ordinary
+/// user's history comes back whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_unhandled_account_is_not_scoped() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+    init_owner_change_table(&pool).await;
+
+    let owner = [1u8; 32];
+    // Its own derived address, so the gateway can tell it was never moved.
+    let token_account = untouched_ata_of(&owner);
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &bs58::encode(owner).into_string()).await;
+    let token = generate_token(user_id, "user");
+
+    let (backend, requests) = start_recording_mock_backend(vec![
+        token_account_response(&owner, None),
+        history_page_for_slots(&[1, 2, 3]),
+    ])
+    .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [bs58::encode(token_account).into_string()]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        forwarded_slot_ranges(&requests),
+        None,
+        "an address that never changed hands is asked for unscoped"
+    );
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(returned_signatures(&body), vec!["sig3", "sig2", "sig1"]);
 }
 
 /// An Operator keeps the raw errors, so diagnostics survive the redaction.

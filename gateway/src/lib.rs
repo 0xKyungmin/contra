@@ -3,9 +3,9 @@ pub mod db;
 pub mod metrics;
 
 use crate::auth::{
-    auth_unavailable_body, check_account_data_ownership, check_request_auth, decode_account_data,
-    forbidden_body, is_gated, redacts_transaction_errors_for, role_check_error_body, verify_bearer,
-    AuthDecision, Role,
+    auth_unavailable_body, check_account_data_ownership, check_request_auth, db_error_body,
+    decode_account_data, forbidden_body, is_gated, is_owner_only, redacts_transaction_errors_for,
+    resolve_owned_slot_ranges, role_check_error_body, verify_bearer, AuthDecision, Role,
 };
 use crate::db::get_user_role;
 use clap::Parser;
@@ -301,6 +301,49 @@ enum AccountFetch {
     Unavailable,
 }
 
+/// How a proxied call must be shaped for this caller: what the request may ask
+/// for, and what the response may carry back.
+///
+/// Both are independent of whether the request was authorized. A caller may be
+/// entitled to a history page and still not to all of it, nor to every field.
+struct CallPolicy {
+    /// Collapse every transaction error in the response to the generic marker.
+    redact_errors: bool,
+    /// Inclusive slot windows this caller owned the address for, passed to the
+    /// node so `limit` counts rows they may see. `None` asks for everything.
+    slot_ranges: Option<Vec<(i64, i64)>>,
+}
+
+impl CallPolicy {
+    /// Nothing to shape, the shape every ungated and internal request takes.
+    fn passthrough() -> Self {
+        Self {
+            redact_errors: false,
+            slot_ranges: None,
+        }
+    }
+}
+
+/// Add the caller's slot scope to an outgoing `getSignaturesForAddress`.
+///
+/// The scope rides in the config object, so params keep Solana's
+/// `[address, config]` shape. It is set, never merged: a caller cannot widen
+/// what the gateway decided, and supplying it themselves gains them nothing
+/// since it can only narrow a page.
+fn apply_slot_ranges(request: &mut Value, ranges: &[(i64, i64)]) {
+    let Some(params) = request.get_mut("params").and_then(|p| p.as_array_mut()) else {
+        return;
+    };
+    // params[0] is the address; the config is optional and may be absent.
+    if params.len() < 2 {
+        params.resize(2, Value::Null);
+    }
+    if !params[1].is_object() {
+        params[1] = serde_json::json!({});
+    }
+    params[1]["privateChannelSlotRanges"] = serde_json::json!(ranges);
+}
+
 /// Tracks how many connections each client IP currently holds. Entries are
 /// removed when an IP's count reaches zero, so the map only holds IPs with a
 /// live connection and stays bounded by the global connection cap.
@@ -432,6 +475,31 @@ fn redact_transaction_errors(body: Bytes) -> Bytes {
         }
     }
     Bytes::from(json.to_string())
+}
+
+/// Report at boot when the ledger table that scopes history is missing.
+///
+/// The core node creates it at startup and the gateway only reads it, so on a
+/// cold start of the whole stack the gateway can easily win the race. That is
+/// why this warns rather than refusing to start: refusing would crash-loop until
+/// the node caught up, and the requests that need the table already fail closed
+/// with a 500 meanwhile. What they don't do is say why, which is this log line's
+/// job.
+async fn warn_if_owner_change_table_missing(pool: &PgPool) {
+    let present: Result<Option<String>, _> =
+        sqlx::query_scalar("SELECT to_regclass('public.token_account_owner_change')::text")
+            .fetch_one(pool)
+            .await;
+
+    match present {
+        Ok(Some(_)) => {}
+        Ok(None) => error!(
+            "token_account_owner_change is missing from the ledger database. \
+             getSignaturesForAddress will answer 500 for every User-role caller \
+             until the core node starts and creates it."
+        ),
+        Err(e) => error!("Could not check for token_account_owner_change: {}", e),
+    }
 }
 
 /// The single error every collapsed transaction reports.
@@ -745,7 +813,7 @@ impl Gateway {
         method_label: &str,
         params: &Value,
         start: Instant,
-    ) -> Result<bool, Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>>>
+    ) -> Result<CallPolicy, Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>>>
     {
         // Auth off, so nothing is redacted either. Every method is ungated in this
         // mode, so a caller reads the balance straight from getTokenAccountBalance
@@ -753,7 +821,7 @@ impl Gateway {
         // operator services, since with no key we cannot tell who is an Operator.
         let (decoding_key, auth_db) = match (&self.jwt_secret, &self.auth_db) {
             (Some(k), Some(db)) => (k, db),
-            _ => return Ok(false),
+            _ => return Ok(CallPolicy::passthrough()),
         };
 
         let mut claims = verify_bearer(auth_header, decoding_key);
@@ -786,7 +854,10 @@ impl Gateway {
         // separate axis: getSignatureStatuses is ungated and still error-bearing.
         // A public method stays available when the auth DB is down; it just redacts.
         if !is_gated(method) {
-            return Ok(redacts_transaction_errors_for(claims.as_ref(), method));
+            return Ok(CallPolicy {
+                redact_errors: redacts_transaction_errors_for(claims.as_ref(), method),
+                slot_ranges: None,
+            });
         }
 
         if role_check_failed {
@@ -804,17 +875,24 @@ impl Gateway {
         let redact = redacts_transaction_errors_for(claims.as_ref(), method);
 
         let (status, body) = match decision {
-            AuthDecision::Proceed => return Ok(redact),
+            // An Operator, whose reads are not scoped to any wallet.
+            AuthDecision::Proceed => {
+                return Ok(CallPolicy {
+                    redact_errors: redact,
+                    slot_ranges: None,
+                })
+            }
             AuthDecision::Reject(status, body) => (status, body),
             AuthDecision::NeedsAccountFetch { user_id, pubkey } => {
-                let result = match self.fetch_account_for_auth(&pubkey).await {
+                let fetched = self.fetch_account_for_auth(&pubkey).await;
+                let result = match &fetched {
                     AccountFetch::Found {
                         data,
                         program_owner,
                     } => {
                         check_account_data_ownership(
-                            &data,
-                            &program_owner,
+                            data,
+                            program_owner,
                             &pubkey,
                             method,
                             user_id,
@@ -831,7 +909,43 @@ impl Gateway {
                     ),
                 };
                 match result {
-                    AuthDecision::Proceed => return Ok(redact),
+                    AuthDecision::Proceed => {
+                        // Owning the account now says nothing about who owned it
+                        // when its older transactions landed, so a history page
+                        // is scoped to the windows this caller held it for.
+                        let slot_ranges = match (&fetched, is_owner_only(method)) {
+                            (
+                                AccountFetch::Found {
+                                    data,
+                                    program_owner,
+                                },
+                                true,
+                            ) => match resolve_owned_slot_ranges(
+                                data,
+                                program_owner,
+                                &pubkey,
+                                user_id,
+                                auth_db,
+                            )
+                            .await
+                            {
+                                Ok(ranges) => ranges,
+                                Err(_) => {
+                                    return Err(self.reject_with_metrics(
+                                        method_label,
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        db_error_body(),
+                                        start,
+                                    ))
+                                }
+                            },
+                            _ => None,
+                        };
+                        return Ok(CallPolicy {
+                            redact_errors: redact,
+                            slot_ranges,
+                        });
+                    }
                     AuthDecision::Reject(status, body) => (status, body),
                     AuthDecision::NeedsAccountFetch { .. } => unreachable!(),
                 }
@@ -1115,13 +1229,13 @@ impl Gateway {
         // Skipped on the internal listener: the operator services carry no JWT,
         // and they need the raw errors their confirmation handling routes on.
         let params = json.get("params").cloned().unwrap_or(Value::Null);
-        let redact_tx_errors = match access {
-            Access::Internal => false,
+        let call_policy = match access {
+            Access::Internal => CallPolicy::passthrough(),
             Access::Public => match self
                 .enforce_auth(auth_header.as_deref(), method, method_label, &params, start)
                 .await
             {
-                Ok(redact) => redact,
+                Ok(policy) => policy,
                 Err(rejection) => return Ok(rejection),
             },
         };
@@ -1147,6 +1261,18 @@ impl Gateway {
                 );
                 return Ok(self.error_response(StatusCode::INTERNAL_SERVER_ERROR, None));
             }
+        };
+
+        // Scoping goes to the node rather than being applied to the page here,
+        // so `limit` counts rows this caller may see and every entry they are
+        // served is one they can page from.
+        let body_bytes = match &call_policy.slot_ranges {
+            Some(ranges) => {
+                let mut scoped = json.clone();
+                apply_slot_ranges(&mut scoped, ranges);
+                Bytes::from(scoped.to_string())
+            }
+            None => body_bytes,
         };
 
         let forwarded_req = match Request::builder()
@@ -1200,7 +1326,7 @@ impl Gateway {
                         "Content-Type, Authorization, solana-client",
                     ),
                 );
-                if !redact_tx_errors {
+                if !call_policy.redact_errors {
                     return Ok(Response::from_parts(parts, body.boxed_unsync()));
                 }
 
@@ -1212,12 +1338,14 @@ impl Gateway {
                         return Ok(self.error_response(StatusCode::BAD_GATEWAY, None));
                     }
                 };
-                // Redaction changes the length, so let hyper re-frame the body.
+                let rewritten = redact_transaction_errors(collected);
+
+                // Rewriting changes the length, so let hyper re-frame the body.
                 parts.headers.remove(hyper::header::CONTENT_LENGTH);
                 parts.headers.remove(hyper::header::TRANSFER_ENCODING);
                 Ok(Response::from_parts(
                     parts,
-                    Full::new(redact_transaction_errors(collected))
+                    Full::new(rewritten)
                         .map_err(|never| match never {})
                         .boxed_unsync(),
                 ))
@@ -1415,6 +1543,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 "  Auth DB: connected (max_connections={})",
                 args.auth_database_max_connections
             );
+            warn_if_owner_change_table_missing(&pool).await;
             Some(pool)
         }
         None => {
@@ -2115,6 +2244,61 @@ mod tests {
         // IPv4 is keyed by the full address.
         let v4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
         assert_eq!(rate_limit_key(v4), v4);
+    }
+
+    /// The config object is optional in the wire format, so scoping a request
+    /// that carries only an address has to create one.
+    #[test]
+    fn scoping_a_request_without_a_config_adds_one() {
+        let mut request = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": ["SomePubkey"]
+        });
+
+        apply_slot_ranges(&mut request, &[(0, 99), (201, i64::MAX)]);
+
+        assert_eq!(
+            request["params"][1]["privateChannelSlotRanges"],
+            json!([[0, 99], [201, i64::MAX]])
+        );
+    }
+
+    /// The caller's own config options survive being scoped.
+    #[test]
+    fn scoping_a_request_keeps_the_callers_config() {
+        let mut request = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": ["SomePubkey", {"limit": 10, "before": "sig1"}]
+        });
+
+        apply_slot_ranges(&mut request, &[(5, 10)]);
+
+        assert_eq!(request["params"][1]["limit"], json!(10));
+        assert_eq!(request["params"][1]["before"], json!("sig1"));
+        assert_eq!(
+            request["params"][1]["privateChannelSlotRanges"],
+            json!([[5, 10]])
+        );
+    }
+
+    /// A caller cannot widen what the gateway decided by sending a scope of
+    /// their own: theirs is replaced, not merged.
+    #[test]
+    fn a_caller_supplied_scope_is_overwritten() {
+        let mut request = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": ["SomePubkey", {"privateChannelSlotRanges": [[0, i64::MAX]]}]
+        });
+
+        apply_slot_ranges(&mut request, &[(5, 10)]);
+
+        assert_eq!(
+            request["params"][1]["privateChannelSlotRanges"],
+            json!([[5, 10]])
+        );
     }
 
     /// Both legs of the balance probe (InsufficientFunds above the source
