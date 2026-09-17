@@ -5,16 +5,17 @@
 //! instance's Associated Token Accounts (ATAs).
 //!
 //! The DB-side formula mirrors exactly what is on-chain:
-//!   `db_expected = all_indexed_deposits − completed_withdrawals`
+//!   `db_expected = all_indexed_deposits - released_withdrawals`
 //!
 //! Deposits increase the ATA balance on-chain the moment they are observed, regardless of
 //! the operator's private_channel minting status (`pending`/`processing`/`completed`/`failed`).
-//! Only completed withdrawals (`release_funds`) reduce the ATA balance.
+//! Only released withdrawals (a `release_funds` the indexer observed at or below the slot)
+//! reduce the ATA balance.
 //!
 //! Flow:
 //! 1. Sweep the escrow instance's on-chain token accounts, summed per mint, noting the
 //!    slot the reading is valid as of.
-//! 2. Query the DB for per-mint aggregate balances (all deposits − completed
+//! 2. Query the DB for per-mint aggregate balances (all deposits - released
 //!    withdrawals), bounded by that slot so both sides describe the same instant.
 //! 3. Compare the union of both mint sets; a mint on only one side compares against 0.
 //! 4. If any mint's channel supply exceeds its custody by more than the threshold, log
@@ -23,16 +24,20 @@
 //!    indexing more slots. A supply that cannot be read at all aborts too, since an
 //!    unreadable channel and a solvent one look the same from here.
 //! 5. A mint whose shortfall (db_expected minus on-chain) exceeds the threshold means the escrow may not cover its liabilities: log an error, emit an alert, and abort startup.
+//!    An escrow checkpoint below the snapshot slot cannot account for recent releases, so the
+//!    comparison is re-read with completed withdrawals counted as released before it is judged.
 //! 6. A surplus (on-chain minus db_expected) is benign and attacker-inducible, so it only logs a warning and never blocks; a shortfall within the threshold also just warns.
 //! 7. If all mints balance (or both sides are empty), log info and continue.
 
 use crate::{
     config::{ProgramType, ReconciliationConfig},
     error::{IndexerError, ReconciliationError},
+    indexer::checkpoint::program_key,
     operator::{
         escrow_sweep::{
             fetch_channel_supply, fetch_escrow_balances_by_mint, CustodySnapshot, SweepFailure,
         },
+        reconciliation::insolvency_tolerance_raw,
         rpc_util::RpcClientWithRetry,
         RetryConfig,
     },
@@ -45,11 +50,20 @@ use solana_sdk::pubkey::Pubkey;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use tracing::{error, info, warn};
 
+/// What this boot tolerates for one mint: the absolute floor, or the same relative cushion
+/// the runtime check applies to custody, whichever is larger.
+fn startup_tolerance_raw(config: &ReconciliationConfig, custody: u64) -> u64 {
+    config.mismatch_threshold_raw.max(insolvency_tolerance_raw(
+        custody,
+        config.reconciliation_tolerance_bps,
+    ))
+}
+
 /// Per-mint result produced during reconciliation.
 #[derive(Debug, Clone)]
 pub struct MintReconciliation {
     pub mint: String,
-    /// Expected balance according to DB: all indexed deposits − completed withdrawals.
+    /// Expected balance according to DB: all indexed deposits - released withdrawals.
     /// Unsigned because it mirrors the escrow ATA balance, itself a u64; a negative
     /// net is clamped to 0 at the call site so this value stays lossless across the
     /// full u64 range instead of truncating at i64::MAX.
@@ -222,6 +236,35 @@ pub async fn reconcile_against_snapshot(
     // would send startup back for another catch-up that cannot change this answer.
     check_channel_supply_invariant(channel_rpc_url, rpc_url, instance_pda, config, &results)
         .await?;
+
+    // A ledger checkpointed below the snapshot is missing releases that already left custody,
+    // and reading those as a shortfall would fail an otherwise healthy boot. Re-read it with
+    // the operator's own completions standing in for the releases the indexer has yet to
+    // record, so a drain nothing accounts for still stops the boot.
+    //
+    // A row reaches `completed` only once its release is finalized, so the only payout this
+    // can subtract early is one finalized between the custody reading and this query. That
+    // window is seconds wide and independent of how far the indexer trails.
+    let committed = storage
+        .get_committed_checkpoint(&program_key(program_type))
+        .await
+        .map_err(ReconciliationError::Storage)?;
+    let results = match committed.filter(|&c| c < snapshot.slot) {
+        Some(committed) => {
+            warn!(
+                committed,
+                snapshot_slot = snapshot.slot,
+                "Ledger is behind the custody snapshot; counting completed withdrawals as released \
+                 for this comparison"
+            );
+            let unpinned = storage
+                .get_mint_balances_for_unpinned_reconciliation(snapshot.slot)
+                .await
+                .map_err(ReconciliationError::Storage)?;
+            build_reconciliation_set(&unpinned, &snapshot.balances)?
+        }
+        None => results,
+    };
 
     classify_and_report(config, &results)?;
 
@@ -561,15 +604,17 @@ fn classify_and_report(
     config: &ReconciliationConfig,
     results: &[MintReconciliation],
 ) -> Result<(), IndexerError> {
-    // Only a shortfall past the threshold is fatal: custody below liabilities.
+    // Only a shortfall past the tolerance is fatal: custody below liabilities.
     let exceeding: Vec<&MintReconciliation> = results
         .iter()
-        .filter(|r| r.shortfall() > config.mismatch_threshold_raw)
+        .filter(|r| r.shortfall() > startup_tolerance_raw(config, r.on_chain_actual))
         .collect();
 
     let within_tolerance: Vec<&MintReconciliation> = results
         .iter()
-        .filter(|r| r.shortfall() > 0 && r.shortfall() <= config.mismatch_threshold_raw)
+        .filter(|r| {
+            r.shortfall() > 0 && r.shortfall() <= startup_tolerance_raw(config, r.on_chain_actual)
+        })
         .collect();
 
     if !exceeding.is_empty() {
@@ -581,6 +626,7 @@ fn classify_and_report(
                 on_chain_actual = r.on_chain_actual,
                 shortfall = r.shortfall(),
                 threshold = config.mismatch_threshold_raw,
+                tolerance = startup_tolerance_raw(config, r.on_chain_actual),
                 "RECONCILIATION ALERT: escrow custody shortfall below DB-expected liabilities exceeds threshold"
             );
         }
@@ -611,6 +657,7 @@ fn classify_and_report(
             on_chain_actual = r.on_chain_actual,
             shortfall = r.shortfall(),
             threshold = config.mismatch_threshold_raw,
+            tolerance = startup_tolerance_raw(config, r.on_chain_actual),
             "Reconciliation: custody shortfall within tolerance, continuing startup"
         );
     }
@@ -715,6 +762,7 @@ mod tests {
     fn test_classify_all_balanced() {
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         };
         let results = vec![
             make_result("mint1", 1000, 1000),
@@ -724,9 +772,57 @@ mod tests {
     }
 
     #[test]
+    fn the_default_config_compares_exactly_as_it_does_today() {
+        // Custody 1000, one raw unit short. At the shipped defaults that still blocks.
+        let results = vec![make_result("mint1", 1001, 1000)];
+        assert!(classify_and_report(&ReconciliationConfig::default(), &results).is_err());
+    }
+
+    #[test]
+    fn a_configured_bps_tolerance_is_a_floor_raised_not_lowered() {
+        // 10 bps of 1000 custody is 1, so a 1-unit shortfall is within it and 2 is not.
+        let bps_only = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+            reconciliation_tolerance_bps: 10,
+        };
+        assert!(classify_and_report(&bps_only, &[make_result("mint1", 1001, 1000)]).is_ok());
+        assert!(classify_and_report(&bps_only, &[make_result("mint1", 1002, 1000)]).is_err());
+
+        // The larger of the two always wins, whichever one it is.
+        let raw_wins = ReconciliationConfig {
+            mismatch_threshold_raw: 50,
+            reconciliation_tolerance_bps: 10,
+        };
+        assert!(classify_and_report(&raw_wins, &[make_result("mint1", 1050, 1000)]).is_ok());
+        assert!(classify_and_report(&raw_wins, &[make_result("mint1", 1051, 1000)]).is_err());
+    }
+
+    #[test]
+    fn zero_custody_still_blocks_at_the_strict_threshold() {
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+            reconciliation_tolerance_bps: 10,
+        };
+        // No custody means no bps term, so the strict raw threshold is the whole bound.
+        assert!(classify_and_report(&config, &[make_result("mint1", 1, 0)]).is_err());
+    }
+
+    #[test]
+    fn reconciliation_config_defaults_are_zero_in_both_paths() {
+        let from_serde: ReconciliationConfig =
+            serde_json::from_str(r#"{"mismatch_threshold_raw": 0}"#).unwrap();
+        assert_eq!(from_serde.reconciliation_tolerance_bps, 0);
+        assert_eq!(
+            ReconciliationConfig::default().reconciliation_tolerance_bps,
+            0
+        );
+    }
+
+    #[test]
     fn test_classify_shortfall_within_tolerance() {
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 10,
+            ..Default::default()
         };
         // shortfall = 5, threshold = 10 => should pass with warning
         let results = vec![make_result("mint1", 1005, 1000)];
@@ -737,6 +833,7 @@ mod tests {
     fn test_classify_shortfall_equals_threshold() {
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 5,
+            ..Default::default()
         };
         // shortfall == threshold => within tolerance (not exceeding)
         let results = vec![make_result("mint1", 1005, 1000)];
@@ -747,6 +844,7 @@ mod tests {
     fn test_classify_shortfall_exceeds_threshold_blocks() {
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 4,
+            ..Default::default()
         };
         // shortfall = 5 > threshold = 4 => error
         let results = vec![make_result("mint1", 1005, 1000)];
@@ -767,6 +865,7 @@ mod tests {
     fn test_classify_strict_zero_threshold_any_shortfall_blocks() {
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         };
         let results = vec![make_result("mint1", 1001, 1000)];
         assert!(classify_and_report(&config, &results).is_err());
@@ -776,6 +875,7 @@ mod tests {
     fn test_classify_surplus_never_blocks() {
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         };
         // A large surplus at the strictest threshold must still pass: surplus is benign.
         let results = vec![make_result("mint1", 1000, 1_000_000)];
@@ -786,6 +886,7 @@ mod tests {
     fn test_classify_surplus_does_not_inflate_block_count() {
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 10,
+            ..Default::default()
         };
         let results = vec![
             make_result("mint1", 1000, 1000),      // balanced
@@ -810,6 +911,7 @@ mod tests {
     fn test_classify_empty_results_passes() {
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         };
         assert!(classify_and_report(&config, &[]).is_ok());
     }
@@ -823,6 +925,7 @@ mod tests {
         // and there is no mismatch.
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         };
         // Simulate: 500 tokens deposited (pending, not yet operator-completed),
         // db_expected = all_deposits(500) - completed_withdrawals(0) = 500
@@ -986,6 +1089,7 @@ mod tests {
     async fn test_reconciliation_skipped_for_withdraw_program() {
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         };
         let storage = Storage::Mock(MockStorage::new());
         let seed = Pubkey::new_unique();
@@ -1009,6 +1113,7 @@ mod tests {
         mock_escrow_sweep(&mut server, &[]).await;
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         };
         let storage = Storage::Mock(MockStorage::new());
         let seed = Pubkey::new_unique();
@@ -1037,6 +1142,7 @@ mod tests {
         let storage = Storage::Mock(MockStorage::new());
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         };
         let seed = Pubkey::new_unique();
         let result = run_startup_reconciliation(
@@ -1070,6 +1176,7 @@ mod tests {
         let storage = Storage::Mock(MockStorage::new());
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         };
         let seed = Pubkey::new_unique();
         let result = run_startup_reconciliation(
@@ -1105,6 +1212,7 @@ mod tests {
 
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         };
         let seed = Pubkey::new_unique();
         let result = run_startup_reconciliation(
@@ -1137,6 +1245,7 @@ mod tests {
 
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         };
         let seed = Pubkey::new_unique();
         let result = run_startup_reconciliation(
@@ -1166,6 +1275,7 @@ mod tests {
 
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 10,
+            ..Default::default()
         };
         let seed = Pubkey::new_unique();
         let result = run_startup_reconciliation(
@@ -1200,6 +1310,7 @@ mod tests {
 
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 10,
+            ..Default::default()
         };
         let seed = Pubkey::new_unique();
         let result = run_startup_reconciliation(
@@ -1223,6 +1334,118 @@ mod tests {
         }
     }
 
+    /// Run startup reconciliation with custody 980 (slot 100), ledger 1000 and the escrow
+    /// checkpoint at `checkpoint`; supply matches custody unless `supply` says otherwise.
+    /// `released_by_status` is what the unpinned read subtracts, i.e. the rows the operator
+    /// marked completed whose release the indexer has not recorded yet.
+    async fn shortfall_with_checkpoint(
+        checkpoint: u64,
+        supply: u64,
+        released_by_status: u64,
+    ) -> Result<(), IndexerError> {
+        let mut server = mockito::Server::new_async().await;
+        let mint = Pubkey::new_unique();
+        mock_escrow_sweep(&mut server, &[(mint.to_string(), 980)]).await;
+        mock_channel_supply(&mut server, supply).await;
+
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1000, 0)]);
+        mock_storage.set_unpinned_mint_balances(vec![make_mint_balance(
+            &mint.to_string(),
+            1000,
+            released_by_status,
+        )]);
+        mock_storage.set_checkpoint("escrow", checkpoint);
+        let storage = Storage::Mock(mock_storage);
+
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 10,
+            ..Default::default()
+        };
+        let url = server.url();
+        run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &storage,
+            &url,
+            Some(&url),
+            &Pubkey::new_unique(),
+        )
+        .await
+    }
+
+    /// A ledger behind the snapshot is missing the releases that already left custody, so
+    /// the rows the operator marked completed stand in for them. A shortfall they explain
+    /// is lag, not a drain, and must not stop startup.
+    #[tokio::test]
+    async fn shortfall_explained_by_completed_withdrawals_does_not_block() {
+        let result = shortfall_with_checkpoint(99, 980, 20).await;
+        assert!(
+            result.is_ok(),
+            "explained shortfall must not block: {result:?}"
+        );
+    }
+
+    /// Nothing in the ledger accounts for the missing custody, by release or by status, so
+    /// a lagging indexer must not turn a real drain into a clean boot.
+    #[tokio::test]
+    async fn unexplained_shortfall_from_a_ledger_behind_the_snapshot_still_blocks() {
+        let result = shortfall_with_checkpoint(99, 980, 0).await;
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::MismatchExceedsThreshold { .. }
+                ))
+            ),
+            "unexplained shortfall must block: {result:?}"
+        );
+    }
+
+    /// The status fallback is only for a ledger that cannot be pinned. Once the checkpoint
+    /// covers the snapshot, a completed row with no observed release stays owed.
+    #[tokio::test]
+    async fn a_covering_ledger_ignores_the_status_fallback() {
+        let result = shortfall_with_checkpoint(100, 980, 20).await;
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::MismatchExceedsThreshold { .. }
+                ))
+            ),
+            "a covering ledger must use observed releases only: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shortfall_from_a_ledger_covering_the_snapshot_still_blocks() {
+        let result = shortfall_with_checkpoint(100, 980, 0).await;
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::MismatchExceedsThreshold { .. }
+                ))
+            ),
+            "a covering ledger must still block: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_behind_the_snapshot_still_enforces_the_supply_invariant() {
+        let result = shortfall_with_checkpoint(99, 1_200, 0).await;
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::SupplyExceedsCustody { .. }
+                ))
+            ),
+            "supply over custody must block whatever the ledger: {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_reconciliation_with_nonzero_withdrawals_balanced() {
         // 1500 deposits, 500 withdrawals => db_expected 1000; on-chain 1000 => balanced.
@@ -1238,6 +1461,7 @@ mod tests {
 
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 10,
+            ..Default::default()
         };
         let seed = Pubkey::new_unique();
         let result = run_startup_reconciliation(
@@ -1277,6 +1501,7 @@ mod tests {
         let storage = Storage::Mock(MockStorage::new());
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         };
         let url = server.url();
         let result = reconcile_against_snapshot(
@@ -1322,6 +1547,7 @@ mod tests {
         let storage = Storage::Mock(mock_storage);
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         };
         let url = server.url();
         let result = reconcile_against_snapshot(
@@ -1365,6 +1591,7 @@ mod tests {
         let storage = Storage::Mock(mock_storage);
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         };
         let url = server.url();
         let result = reconcile_against_snapshot(
@@ -1463,6 +1690,7 @@ mod tests {
 
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         };
         let seed = Pubkey::new_unique();
         let url = server.url();
@@ -1563,6 +1791,7 @@ mod tests {
 
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         };
         let seed = Pubkey::new_unique();
         let url = server.url();
@@ -1605,6 +1834,7 @@ mod tests {
 
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         };
         let seed = Pubkey::new_unique();
         let url = server.url();
@@ -1664,6 +1894,7 @@ mod tests {
 
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         };
         let seed = Pubkey::new_unique();
         let url = server.url();
@@ -1705,6 +1936,7 @@ mod tests {
 
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 10,
+            ..Default::default()
         };
         let seed = Pubkey::new_unique();
         let url = server.url();
@@ -1744,6 +1976,7 @@ mod tests {
 
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 10,
+            ..Default::default()
         };
         let seed = Pubkey::new_unique();
         let url = server.url();
@@ -1783,6 +2016,7 @@ mod tests {
 
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 10,
+            ..Default::default()
         };
         let seed = Pubkey::new_unique();
         let url = server.url();
@@ -1806,6 +2040,7 @@ mod tests {
     async fn startup_reconciliation_surplus_passes_but_supply_breach_halts() {
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 10,
+            ..Default::default()
         };
         let seed = Pubkey::new_unique();
 

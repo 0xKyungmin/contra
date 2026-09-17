@@ -237,6 +237,7 @@ fn spawn_indexer_with(
         },
         reconciliation: ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         },
     };
 
@@ -503,6 +504,24 @@ async fn seed_phantom_deposit(pool: &PgPool, mint_address: &str, amount: i64) {
     .execute(pool)
     .await
     .expect("seed deposit");
+}
+
+/// Insert a withdrawal the operator has already confirmed finalized. It carries no
+/// `observed_releases` row, standing in for a payout the escrow indexer has not reached.
+async fn seed_completed_withdrawal(pool: &PgPool, mint_address: &str, amount: i64) {
+    sqlx::query(
+        "INSERT INTO transactions
+         (signature, slot, initiator, recipient, mint, amount,
+          transaction_type, status, created_at, updated_at)
+         VALUES ($1, 1, 'phantom', 'phantom', $2, $3,
+                 'withdrawal'::transaction_type, 'completed'::transaction_status, NOW(), NOW())",
+    )
+    .bind(format!("phantom_withdrawal_{mint_address}"))
+    .bind(mint_address)
+    .bind(amount)
+    .execute(pool)
+    .await
+    .expect("seed withdrawal");
 }
 
 /// Slot and amount of the single indexed deposit for `mint`, if it has been written yet.
@@ -1125,6 +1144,216 @@ async fn rpc_polling_start_slot_ahead_of_checkpoint_refuses_startup() {
         Some(stale_checkpoint),
         "a refused boot must leave the durable checkpoint exactly where it was"
     );
+    chain.shutdown().await;
+}
+
+/// Answer the startup supply invariant with a channel mint holding `supply`.
+///
+/// Packed as a real SPL mint account so the invariant decodes it the way it decodes the
+/// live chain; the queue is stocked well past what the re-read rounds consume.
+fn mock_channel_supply(rpc: &MockRpcServer, supply: u64) {
+    use base64::Engine as _;
+    use spl_token::solana_program::program_option::COption;
+    use spl_token::solana_program::program_pack::Pack;
+    use spl_token::state::Mint;
+
+    let mint_state = Mint {
+        mint_authority: COption::Some(Pubkey::new_unique()),
+        supply,
+        decimals: 6,
+        is_initialized: true,
+        freeze_authority: COption::None,
+    };
+    let mut buf = vec![0u8; Mint::LEN];
+    mint_state.pack_into_slice(&mut buf);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
+
+    let reply = Reply::result(json!({
+        "context": {"slot": MOCK_TIP},
+        "value": {
+            "owner": TOKEN_PROGRAM_ID.to_string(),
+            "lamports": 1_000_000,
+            "data": [encoded, "base64"],
+            "executable": false,
+            "rentEpoch": 0,
+            "space": Mint::LEN,
+        }
+    }));
+    rpc.enqueue_sequence("getAccountInfo", std::iter::repeat_n(reply, 4096));
+}
+
+/// With backfill off nothing imports the slots between the checkpoint and the custody
+/// reading, so a payout that already left custody is not in the ledger yet and the mint
+/// reads as owing more than it holds. The operator's own `completed` row explains that
+/// gap, so the boot has to proceed instead of aborting on the indexer's lag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backfill_disabled_counts_completed_withdrawals_when_the_checkpoint_is_behind() {
+    init_tracing();
+    let (_pg, pool, postgres) = start_postgres("startup_nofill_completed").await;
+
+    seed_checkpoint(&pool, "escrow", (MOCK_TIP - 5) as i64).await;
+    let mint = Pubkey::new_unique().to_string();
+    seed_phantom_deposit(&pool, &mint, PHANTOM_AMOUNT).await;
+    // No `observed_releases` row: the release is exactly what the lagging ledger is missing.
+    seed_completed_withdrawal(&pool, &mint, PHANTOM_AMOUNT).await;
+
+    let mut rpc = MockitoServer::new_async().await;
+    let _custody = mock_escrow_custody(&mut rpc, &[]).await;
+
+    let chain = MockRpcServer::start().await;
+    mock_empty_channel_supply(&chain);
+
+    let mut handle = spawn_indexer_with(
+        postgres,
+        rpc.url(),
+        chain.url(),
+        Pubkey::new_unique(),
+        None,
+        None,
+    );
+
+    // Reconciliation runs before the live source on this path, so a few seconds is well
+    // past the point where an abort would have ended the task.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(
+        !handle.is_finished(),
+        "a shortfall a completed withdrawal explains must not abort the boot: {:?}",
+        (&mut handle).await
+    );
+
+    handle.abort();
+    chain.shutdown().await;
+}
+
+/// The fallback is the operator's own completions and nothing else. A lagging checkpoint
+/// with no completion behind the gap is a drain nothing accounts for, so the boot stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backfill_disabled_still_aborts_on_a_shortfall_no_completion_explains() {
+    init_tracing();
+    let (_pg, pool, postgres) = start_postgres("startup_nofill_unexplained").await;
+
+    seed_checkpoint(&pool, "escrow", (MOCK_TIP - 5) as i64).await;
+    let phantom_mint = Pubkey::new_unique().to_string();
+    seed_phantom_deposit(&pool, &phantom_mint, PHANTOM_AMOUNT).await;
+
+    let mut rpc = MockitoServer::new_async().await;
+    let _custody = mock_escrow_custody(&mut rpc, &[]).await;
+
+    let chain = MockRpcServer::start().await;
+    mock_empty_channel_supply(&chain);
+
+    let handle = spawn_indexer_with(
+        postgres,
+        rpc.url(),
+        chain.url(),
+        Pubkey::new_unique(),
+        None,
+        None,
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(STARTUP_TIMEOUT_SECS), handle)
+        .await
+        .expect("startup must terminate on an unbacked ledger row")
+        .expect("run task must not panic");
+
+    match result {
+        Err(IndexerError::Reconciliation(ReconciliationError::MismatchExceedsThreshold {
+            threshold,
+            ..
+        })) => assert_eq!(
+            threshold, 0,
+            "the strict threshold must be the one enforced"
+        ),
+        other => panic!("expected a mismatch halt, got {other:?}"),
+    }
+
+    chain.shutdown().await;
+}
+
+/// The fallback is bounded by the snapshot slot, not by the mere presence of a checkpoint.
+/// A checkpoint that reaches the reading leaves nothing unimported below it, so the ledger
+/// is read as it stands and the same unbacked row aborts the boot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backfill_disabled_compares_when_the_checkpoint_reaches_the_snapshot() {
+    init_tracing();
+    let (_pg, pool, postgres) = start_postgres("startup_nofill_compare").await;
+
+    seed_checkpoint(&pool, "escrow", MOCK_TIP as i64).await;
+    let phantom_mint = Pubkey::new_unique().to_string();
+    seed_phantom_deposit(&pool, &phantom_mint, PHANTOM_AMOUNT).await;
+
+    let mut rpc = MockitoServer::new_async().await;
+    let _custody = mock_escrow_custody(&mut rpc, &[]).await;
+
+    let chain = MockRpcServer::start().await;
+    mock_empty_channel_supply(&chain);
+
+    let handle = spawn_indexer_with(
+        postgres,
+        rpc.url(),
+        chain.url(),
+        Pubkey::new_unique(),
+        None,
+        None,
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(STARTUP_TIMEOUT_SECS), handle)
+        .await
+        .expect("startup must terminate on an unbacked ledger row")
+        .expect("run task must not panic");
+
+    match result {
+        Err(IndexerError::Reconciliation(ReconciliationError::MismatchExceedsThreshold {
+            threshold,
+            ..
+        })) => assert_eq!(
+            threshold, 0,
+            "the strict threshold must be the one enforced"
+        ),
+        other => panic!("expected a mismatch halt, got {other:?}"),
+    }
+
+    chain.shutdown().await;
+}
+
+/// The completion fallback must not disarm the other invariant. Supply above custody is
+/// read from the chain on both sides, so a lagging ledger says nothing about it and the
+/// boot still has to stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backfill_disabled_with_a_lagging_checkpoint_still_enforces_the_supply_invariant() {
+    init_tracing();
+    let (_pg, pool, postgres) = start_postgres("startup_nofill_supply").await;
+
+    seed_checkpoint(&pool, "escrow", (MOCK_TIP - 5) as i64).await;
+    let phantom_mint = Pubkey::new_unique().to_string();
+    seed_phantom_deposit(&pool, &phantom_mint, PHANTOM_AMOUNT).await;
+
+    let mut rpc = MockitoServer::new_async().await;
+    let _custody = mock_escrow_custody(&mut rpc, &[]).await;
+
+    // Custody holds nothing, so any supply at all is supply the escrow cannot honour.
+    let chain = MockRpcServer::start().await;
+    mock_channel_supply(&chain, PHANTOM_AMOUNT as u64);
+
+    let handle = spawn_indexer_with(
+        postgres,
+        rpc.url(),
+        chain.url(),
+        Pubkey::new_unique(),
+        None,
+        None,
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(STARTUP_TIMEOUT_SECS), handle)
+        .await
+        .expect("startup must terminate on supply beyond custody")
+        .expect("run task must not panic");
+
+    match result {
+        Err(IndexerError::Reconciliation(ReconciliationError::SupplyExceedsCustody { .. })) => {}
+        other => panic!("expected a supply-invariant halt, got {other:?}"),
+    }
+
     chain.shutdown().await;
 }
 

@@ -185,6 +185,51 @@ const DROP_STATEMENTS: [&str; 10] = [
     "DROP TYPE IF EXISTS transaction_type CASCADE",
 ];
 
+/// A withdrawal counts as paid out when the escrow indexer recorded its release at or below
+/// the bound. `r` is the aggregate's join, which carries that bound.
+const RELEASED_BY_OBSERVATION: &str = "r.withdrawal_nonce IS NOT NULL";
+
+/// The same, plus the operator's own record of a confirmed payout. `completed` carries no
+/// slot, so it can only misjudge a payout finalized after the custody reading: the window
+/// between that reading and this query, not the indexer's lag.
+const RELEASED_BY_OBSERVATION_OR_STATUS: &str =
+    "(t.status = 'completed' OR r.withdrawal_nonce IS NOT NULL)";
+
+/// The per-mint reconciliation aggregate. Only the test for a released withdrawal varies, so
+/// both reads share one shape and one mint universe.
+///
+/// A payout discharges what the chain says it moved, capped at what its row owed: releasing
+/// less leaves the rest owed, and releasing more leaves the excess standing as a shortfall
+/// rather than netting itself out against the custody it took.
+fn mint_balances_query(released: &str) -> String {
+    format!(
+        r#"
+            SELECT
+                m.mint_address,
+                m.token_program,
+                COALESCE(
+                    SUM(CASE WHEN t.transaction_type = 'deposit' THEN t.amount ELSE 0 END),
+                    0
+                )::NUMERIC AS total_deposits,
+                COALESCE(
+                    SUM(CASE WHEN t.transaction_type = 'withdrawal'
+                              AND {released}
+                             THEN LEAST(COALESCE(r.amount::NUMERIC, t.amount), t.amount)
+                             ELSE 0 END),
+                    0
+                )::NUMERIC AS total_withdrawals
+            FROM mints m
+            LEFT JOIN transactions t
+              ON t.mint = m.mint_address
+             AND (t.transaction_type = 'withdrawal' OR t.slot <= $1)
+            LEFT JOIN observed_releases r
+              ON r.withdrawal_nonce = t.withdrawal_nonce
+             AND r.slot <= $1
+            GROUP BY m.mint_address, m.token_program
+            "#
+    )
+}
+
 impl PostgresDb {
     pub async fn new(config: &PostgresConfig) -> Result<Self, sqlx::Error> {
         // Fail closed: reject a blank password before connecting (blanked env templates interpolate an empty ${POSTGRES_PASSWORD} into a passwordless URL).
@@ -805,12 +850,19 @@ impl PostgresDb {
                 withdrawal_nonce BIGINT PRIMARY KEY,
                 signature TEXT NOT NULL,
                 slot BIGINT NOT NULL,
+                amount BIGINT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             "#,
         )
         .execute(&self.pool)
         .await?;
+
+        // Nullable on purpose: rows written before this column fall back to the withdrawal
+        // row's own amount, so the upgrade needs no backfill.
+        sqlx::query("ALTER TABLE observed_releases ADD COLUMN IF NOT EXISTS amount BIGINT")
+            .execute(&self.pool)
+            .await?;
 
         // Write-ahead log for compensating remint MintTo signatures. Separate
         // from pending_release_signatures because these land on the source
@@ -2352,14 +2404,15 @@ impl PostgresDb {
         for release in releases {
             sqlx::query(
                 r#"
-                INSERT INTO observed_releases (withdrawal_nonce, signature, slot)
-                VALUES ($1, $2, $3)
+                INSERT INTO observed_releases (withdrawal_nonce, signature, slot, amount)
+                VALUES ($1, $2, $3, $4)
                 ON CONFLICT (withdrawal_nonce) DO NOTHING
                 "#,
             )
             .bind(release.withdrawal_nonce)
             .bind(&release.signature)
             .bind(release.slot)
+            .bind(release.amount)
             .execute(&self.pool)
             .await?;
         }
@@ -2373,7 +2426,7 @@ impl PostgresDb {
     ) -> Result<Option<DbObservedRelease>, sqlx::Error> {
         sqlx::query_as::<_, DbObservedRelease>(
             r#"
-            SELECT withdrawal_nonce, signature, slot
+            SELECT withdrawal_nonce, signature, slot, amount
             FROM observed_releases
             WHERE withdrawal_nonce = $1
             "#,
@@ -2727,53 +2780,37 @@ impl PostgresDb {
         )
     }
 
-    /// Return per-mint aggregate balances for startup reconciliation.
-    ///
-    /// For each mint known to the DB, sums:
-    /// - `total_deposits`  : ALL indexed deposits (any status), because a deposit increases
-    ///   the escrow ATA balance on-chain the moment it is observed — the operator's private_channel minting
-    ///   status (`pending`/`processing`/`completed`/`failed`) does not change what is on-chain.
-    /// - `total_withdrawals`: only `completed` withdrawals, because only a completed
-    ///   `release_funds` call actually moves tokens out of the ATA.
-    ///
-    /// Mints with no transactions still appear (with totals = 0) because of the LEFT JOIN.
-    ///
-    /// `as_of_slot` bounds the totals to what was indexed at or below that slot, so the
-    /// answer describes the ledger at one point rather than at whatever moment the query
-    /// happened to run. The bound sits in the JOIN, not a WHERE clause, because moving it
-    /// to WHERE would discard the NULL rows the LEFT JOIN produces for a mint with no
-    /// qualifying transactions and silently drop that mint from the comparison.
+    /// Per-mint ledger for startup and runtime reconciliation: every deposit at or below
+    /// `as_of_slot` in any status, minus withdrawals whose release was observed at or below it.
+    /// The bound sits in the JOIN, not WHERE, so a mint with no qualifying rows still reports 0.
     pub async fn get_mint_balances_for_reconciliation_internal(
         &self,
         as_of_slot: i64,
     ) -> Result<Vec<MintDbBalance>, sqlx::Error> {
-        sqlx::query_as::<_, MintDbBalance>(
-            r#"
-            SELECT
-                m.mint_address,
-                m.token_program,
-                COALESCE(
-                    SUM(CASE WHEN t.transaction_type = 'deposit' THEN t.amount ELSE 0 END),
-                    0
-                )::NUMERIC AS total_deposits,
-                COALESCE(
-                    SUM(CASE WHEN t.transaction_type = 'withdrawal' AND t.status = 'completed' THEN t.amount ELSE 0 END),
-                    0
-                )::NUMERIC AS total_withdrawals
-            FROM mints m
-            LEFT JOIN transactions t ON t.mint = m.mint_address AND t.slot <= $1
-            GROUP BY m.mint_address, m.token_program
-            "#,
-        )
-        .bind(as_of_slot)
-        .fetch_all(&self.pool)
-        .await
+        // Withdrawal rows carry a channel slot, not a Solana one, so the bound limits deposits only.
+        // Status is not trusted for withdrawals: it turns completed after the payout and has no Solana slot.
+        sqlx::query_as::<_, MintDbBalance>(&mint_balances_query(RELEASED_BY_OBSERVATION))
+            .bind(as_of_slot)
+            .fetch_all(&self.pool)
+            .await
     }
 
-    /// Every mint address the DB knows: the mint universe that runtime reconciliation checks.
-    ///
-    /// Addresses only: runtime compares on-chain custody against on-chain channel
-    /// supply, so no ledger amount is read here and none is aggregated.
+    /// The same ledger for a caller that cannot pin the indexer to `as_of_slot`, which also
+    /// counts a withdrawal the operator marked `completed` as paid out: that status is only
+    /// written once the release confirms, so it stands in for a release row not yet indexed.
+    pub async fn get_mint_balances_for_unpinned_reconciliation_internal(
+        &self,
+        as_of_slot: i64,
+    ) -> Result<Vec<MintDbBalance>, sqlx::Error> {
+        sqlx::query_as::<_, MintDbBalance>(&mint_balances_query(RELEASED_BY_OBSERVATION_OR_STATUS))
+            .bind(as_of_slot)
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    /// Every mint address the DB knows: the mint universe runtime reconciliation checks.
+    /// Addresses only, so it can be read before the tick knows whether the ledger is
+    /// pinnable at all.
     pub async fn get_mint_addresses_internal(&self) -> Result<Vec<String>, sqlx::Error> {
         sqlx::query_scalar("SELECT mint_address FROM mints")
             .fetch_all(&self.pool)
