@@ -811,10 +811,13 @@ async fn check_withdrawal_preflights_inner(
 /// The program caps extras at 32 (`MAX_HOOK_REMAINING_ACCOUNTS` in its
 /// `token_utils`, which codama does not export), but the transport binds first:
 /// the sender builds a legacy message with no lookup tables, and the 1232-byte
-/// packet holds 699 bytes of release plus 33 per extra, so 16 fit and 17 does
+/// packet holds 732 bytes of release plus 33 per extra, so 15 fit and 16 does
 /// not. Raise it toward 32 if the sender ever moves to versioned transactions
 /// with a lookup table, or to v1 transactions with their larger limit.
-const MAX_HOOK_EXTRAS_LEGACY_TX: usize = 16;
+///
+/// The release grew by one account key plus its index byte, the same 33 bytes
+/// an extra costs, when ReleaseFunds gained its memo_program slot.
+const MAX_HOOK_EXTRAS_LEGACY_TX: usize = 15;
 
 /// Append the mint's transfer-hook accounts to a built release, so Token-2022
 /// can resolve the hook. A no-op for mints without one.
@@ -1251,14 +1254,19 @@ mod tests {
     use crate::operator::bitmap_constants::NONCES_PER_GENERATION;
     use crate::operator::find_allowed_mint_pda;
     use crate::operator::rpc_util::RpcClientWithRetry;
+    use crate::operator::sender::types::InstructionWithSigners;
     use crate::operator::utils::account_util::bitmap_account_bytes;
+    use crate::operator::utils::transaction_util::build_and_sign;
     use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::models::DbMint;
     use crate::storage::common::models::TransactionType;
     use crate::storage::common::storage::mock::MockStorage;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
+    use private_channel_core::rpc::constants::PACKET_DATA_SIZE;
     use solana_client::rpc_request::RpcRequest;
+    use solana_sdk::hash::Hash;
+    use solana_sdk::instruction::AccountMeta;
     use solana_sdk::program_option::COption;
     use solana_sdk::program_pack::Pack;
     use spl_token_2022::state::Mint as Token2022MintState;
@@ -2518,6 +2526,94 @@ mod tests {
         assert!(
             sender_rx.try_recv().is_err(),
             "unexpected message on sender channel"
+        );
+    }
+
+    // ── transfer-hook extras wire budget ────────────────────────────
+
+    /// Serialized size of a release carrying `extras` transfer-hook accounts,
+    /// assembled the way the sender assembles one: same compute-budget prefix,
+    /// same legacy message. Every extra is a fresh key, so none of them dedupes
+    /// against the fixed prefix and the size is the worst case for that count.
+    async fn release_wire_len(extras: usize) -> usize {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_mint_row(&storage, &mint);
+
+        let mut processor_state = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::new(storage),
+        };
+        let txn = make_db_transaction(
+            1,
+            &mint.to_string(),
+            &Pubkey::new_unique().to_string(),
+            Some(3),
+            TransactionType::Withdrawal,
+        );
+
+        let mut tx_builder = build_release_funds(&mut processor_state, &txn)
+            .await
+            .expect("a valid withdrawal row must build");
+        let compute_unit_price = tx_builder.compute_unit_price();
+        let compute_budget = tx_builder.compute_budget();
+        let TransactionBuilder::ReleaseFunds(release) = &mut tx_builder else {
+            unreachable!("build_release_funds returns a release");
+        };
+        let hook_extras: Vec<AccountMeta> = (0..extras)
+            .map(|_| AccountMeta::new_readonly(Pubkey::new_unique(), false))
+            .collect();
+        release.builder.add_remaining_accounts(&hook_extras);
+
+        let mut mocks = std::collections::HashMap::new();
+        mocks.insert(
+            RpcRequest::GetLatestBlockhash,
+            serde_json::json!({
+                "context": {"slot": 1},
+                "value": {
+                    "blockhash": Hash::default().to_string(),
+                    "lastValidBlockHeight": 100
+                }
+            }),
+        );
+
+        let (transaction, ..) = build_and_sign(
+            &RpcClientWithRetry::new_mocked(mocks),
+            InstructionWithSigners {
+                instructions: vec![release.builder.instruction()],
+                fee_payer: processor_state.admin_pubkey,
+                // A signature is fixed-width, so an unsigned transaction weighs
+                // exactly what the signed one the sender broadcasts weighs.
+                signers: vec![],
+                compute_unit_price,
+                compute_budget,
+            },
+        )
+        .await
+        .expect("the mocked blockhash read must succeed");
+
+        bincode::serialize(&transaction)
+            .expect("a built transaction serializes")
+            .len()
+    }
+
+    /// The cap is a wire-size budget, so hold it to the wire rather than to the
+    /// arithmetic in the comment above it: the next account added to the release
+    /// path fails here instead of landing as a production "transaction too
+    /// large", and a cap left lower than the packet allows fails too.
+    #[tokio::test]
+    async fn hook_extras_cap_is_the_widest_release_a_legacy_packet_holds() {
+        let at_cap = release_wire_len(MAX_HOOK_EXTRAS_LEGACY_TX).await;
+        let past_cap = release_wire_len(MAX_HOOK_EXTRAS_LEGACY_TX + 1).await;
+
+        assert!(
+            at_cap <= PACKET_DATA_SIZE,
+            "a release with {MAX_HOOK_EXTRAS_LEGACY_TX} extras serializes to {at_cap} bytes, past the {PACKET_DATA_SIZE}-byte packet"
+        );
+        assert!(
+            past_cap > PACKET_DATA_SIZE,
+            "a release with one extra past the cap serializes to {past_cap} bytes and still fits the packet, so the cap is lower than it needs to be"
         );
     }
 
