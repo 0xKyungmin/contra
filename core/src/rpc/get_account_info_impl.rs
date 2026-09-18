@@ -146,3 +146,108 @@ async fn build_token_additional_data(
         }),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_account_decoder_client_types::UiAccountData;
+    use spl_token::solana_program::program_option::COption;
+    use spl_token::state::AccountState;
+    use std::sync::Arc;
+
+    fn spl_owned(data: Vec<u8>) -> AccountSharedData {
+        AccountSharedData::from(solana_sdk::account::Account {
+            lamports: 1,
+            data,
+            owner: spl_token::id(),
+            executable: false,
+            rent_epoch: 0,
+        })
+    }
+
+    fn packed_mint(decimals: u8) -> Vec<u8> {
+        let mut data = vec![0u8; Mint::LEN];
+        Mint::pack(
+            Mint {
+                mint_authority: COption::None,
+                supply: 1_000_000,
+                decimals,
+                is_initialized: true,
+                freeze_authority: COption::None,
+            },
+            &mut data,
+        )
+        .expect("mint must pack");
+        data
+    }
+
+    fn packed_token_account(mint: Pubkey, amount: u64) -> Vec<u8> {
+        let mut data = vec![0u8; TokenAccount::LEN];
+        TokenAccount::pack(
+            TokenAccount {
+                mint,
+                owner: Pubkey::new_unique(),
+                amount,
+                delegate: COption::None,
+                state: AccountState::Initialized,
+                is_native: COption::None,
+                delegated_amount: 0,
+                close_authority: COption::None,
+            },
+            &mut data,
+        )
+        .expect("token account must pack");
+        data
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn json_parsed_token_account_is_parsed_and_carries_mint_decimals() {
+        let (postgres_db, _pg) = crate::test_helpers::start_test_postgres_raw().await;
+        let mut db = crate::accounts::AccountsDB::Postgres(postgres_db);
+
+        let mint_key = Pubkey::new_unique();
+        let token_key = Pubkey::new_unique();
+        db.set_account(mint_key, spl_owned(packed_mint(6))).await;
+        db.set_account(
+            token_key,
+            spl_owned(packed_token_account(mint_key, 1_500_000)),
+        )
+        .await;
+
+        let deps = ReadDeps {
+            accounts_db: db,
+            admin_keys: vec![],
+            live_blockhashes: Arc::new(std::sync::RwLock::new(Default::default())),
+            max_blockhashes: 150,
+            simulation_permits: tokio::sync::Semaphore::new(1),
+        };
+
+        let response = get_account_info_impl(
+            &deps,
+            token_key.to_string(),
+            Some(RpcAccountInfoConfig {
+                encoding: Some(UiAccountEncoding::JsonParsed),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("the token account must be served");
+
+        let account = response.value.expect("the token account must be present");
+        match &account.data {
+            UiAccountData::Json(parsed) => {
+                assert_eq!(parsed.program, "spl-token");
+                assert_eq!(
+                    parsed.parsed["info"]["tokenAmount"]["decimals"].as_u64(),
+                    Some(6),
+                    "the mint decimals must reach the parser: {}",
+                    parsed.parsed
+                );
+            }
+            UiAccountData::Binary(_, encoding) => {
+                panic!("jsonParsed fell back to {encoding:?} instead of parsing the token account")
+            }
+            other => panic!("unexpected account data: {other:?}"),
+        }
+    }
+}
